@@ -92,8 +92,10 @@ jobs:
           cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" "dist/${{ matrix.asset }}"
           test -s "dist/${{ matrix.asset }}"
 
+      # each target uploads its own binary. no generated notes, no body edits:
+      # three matrix jobs appending notes gave us three changelog links.
       - uses: softprops/action-gh-release@v3
         with:
           files: dist/*
-          generate_release_notes: true
+          generate_release_notes: false
           fail_on_unmatched_files: true
