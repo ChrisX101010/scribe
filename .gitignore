@@ -1,0 +1,7 @@
+/target
+*.part
+*.part.*
+transcript*
+
+# Cargo.lock stays in: this is a binary, and reproducible builds are the whole
+# point. libraries can ignore it; we are not a library.
