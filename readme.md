@@ -44,7 +44,11 @@ the managed copy if you have none.
 Models live in `~/.cache/scribe/models`. Press `m` in the TUI to pick one and it
 downloads itself from Hugging Face. Start with `small-q5_1`. Downloads are
 checked against the upstream SHA-256 before they are accepted; a bad file gets
-deleted and retried.
+deleted and retried. Catalog names (`small-q5_1`, `large-v3-turbo-q5_0`), their
+`ggml-*.bin` filenames, and explicit filesystem paths all work with `--model`.
+A name that is not in the catalog and is not a path is rejected with a clear
+error instead of being guessed. Cached files are size-checked on use and
+verified before activation in the picker.
 
 Settings made in the TUI persist in `~/.config/scribe/config` (or
 `$XDG_CONFIG_HOME/scribe/config`). Command-line options win over saved values.
@@ -174,9 +178,12 @@ Custom ggml files work through `--model <path>` but do not show up in the picker
 `txt`, `srt`, `vtt`, `md`, `json`. Files go next to the source, or into `--out`.
 Existing files are not overwritten; move them yourself.
 
-Word timings come from whisper's token data. `srt` and `vtt` get per-word cues,
-`json` gets a `words` array per segment, and markdown turns each word into a
-clickable timestamp link when the source is a YouTube URL.
+Word timings come from whisper's token data. In `srt` and `vtt`, segments with
+word timings produce one cue per word (no overlapping segment cue); segments
+without word timings produce a single segment cue. Cues are sorted, clamped so
+they never overlap, and sanitized to one line. `json` gets a `words` array per
+segment, and markdown turns each word into a clickable timestamp link when the
+source is a YouTube URL.
 
 ## performance notes
 

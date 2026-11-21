@@ -75,16 +75,19 @@ pub fn is_youtube_url(s: &str) -> bool {
 /// dig the video id out of a youtube url. handles the three shapes people
 /// actually paste: watch, youtu.be and embed/shorts.
 pub fn youtube_id(s: &str) -> Option<String> {
+    fn non_empty(value: &str) -> Option<String> {
+        let value = value.split(['?', '#', '/']).next()?.trim();
+        (!value.is_empty()).then(|| value.to_string())
+    }
     let lower = s.to_ascii_lowercase();
     if lower.contains("youtu.be/") {
-        let rest = s.split("youtu.be/").nth(1)?;
-        return Some(rest.split(['?', '#', '/']).next()?.to_string());
+        return non_empty(s.split("youtu.be/").nth(1)?);
     }
     if lower.contains("youtube.com/watch") {
         let rest = s.split('?').nth(1)?;
         for pair in rest.split('&') {
             if let Some(v) = pair.strip_prefix("v=") {
-                return Some(v.split(['#', '&']).next()?.to_string());
+                return non_empty(v);
             }
         }
     }
@@ -94,8 +97,7 @@ pub fn youtube_id(s: &str) -> Option<String> {
         } else {
             "/shorts/"
         };
-        let rest = s.split(marker).nth(1)?;
-        return Some(rest.split(['?', '#', '/']).next()?.to_string());
+        return non_empty(s.split(marker).nth(1)?);
     }
     None
 }
@@ -439,6 +441,17 @@ mod tests {
         assert!(is_url("HTTP://EXAMPLE.COM"));
         assert!(!is_url("/tmp/a.wav"));
         assert!(!is_url(r"c:\audio\file.wav"));
+        // schemes that look like urls but are not http(s) are paths
+        assert!(!is_url("ftp://example.com/a"));
+        assert!(!is_url("file:///tmp/a.wav"));
+        assert!(!is_url("not a url"));
+    }
+
+    #[test]
+    fn invalid_youtube_urls_do_not_produce_links() {
+        assert!(youtube_id("https://youtu.be/").is_none());
+        assert!(youtube_id("https://youtube.com/watch?x=1").is_none());
+        assert!(youtube_link("https://example.com/a", 0).is_none());
     }
 
     #[test]

@@ -121,8 +121,12 @@ pub const HELP_SECTIONS: &[HelpSection] = &[
                 desc: "force the completion list open",
             },
             HelpLine {
-                key: "esc / space / p",
+                key: "esc",
                 desc: "pause active job; press again to stop",
+            },
+            HelpLine {
+                key: "space / p",
+                desc: "pause or resume the active job",
             },
             HelpLine {
                 key: "c",
@@ -297,6 +301,7 @@ pub fn parse(argv: &[String]) -> Result<Args, String> {
             "--help" | "-h" => out.help = true,
             "--version" | "-V" => out.version = true,
             "--no-tui" => out.no_tui = true,
+            "--translate" => out.translate = Some(true),
             "--model" | "-m" => {
                 let value = need_value(argv, &mut i, arg)?;
                 if value.starts_with('-') {
@@ -402,8 +407,51 @@ mod tests {
         assert!(a(&["--threads"]).is_err());
         assert!(a(&["--threads", "x"]).is_err());
         assert!(a(&["--threads", "0"]).is_err());
+        assert!(a(&["--threads", "257"]).is_err());
         assert!(a(&["--format", "nope"]).is_err());
         assert!(a(&["--unknown"]).is_err());
         assert!(a(&["a", "b"]).is_err());
+        assert!(a(&["--model"]).is_err());
+        assert!(a(&["--lang"]).is_err());
+        assert!(a(&["--out"]).is_err());
+        assert!(a(&["--theme"]).is_err());
+    }
+
+    #[test]
+    fn all_options_parse() {
+        let args = a(&[
+            "audio.wav",
+            "--model",
+            "small-q5_1",
+            "--threads",
+            "8",
+            "--lang",
+            "de",
+            "--translate",
+            "--out",
+            "/tmp/out",
+            "--format",
+            "vtt",
+            "--theme",
+            "nord",
+            "--no-tui",
+        ])
+        .unwrap();
+        assert_eq!(args.input.as_deref(), Some("audio.wav"));
+        assert_eq!(args.model.unwrap().to_str(), Some("small-q5_1"));
+        assert_eq!(args.threads, Some(8));
+        assert_eq!(args.lang.as_deref(), Some("de"));
+        assert!(args.translate.unwrap());
+        assert_eq!(args.out.unwrap().to_str(), Some("/tmp/out"));
+        assert_eq!(args.format, Format::Vtt);
+        assert!(args.format_explicit);
+        assert_eq!(args.theme.as_deref(), Some("nord"));
+        assert!(args.no_tui);
+    }
+
+    #[test]
+    fn separator_accepts_dashed_input() {
+        let args = a(&["--", "-weird-name.wav"]).unwrap();
+        assert_eq!(args.input.as_deref(), Some("-weird-name.wav"));
     }
 }

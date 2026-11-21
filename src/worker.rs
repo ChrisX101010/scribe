@@ -119,10 +119,13 @@ fn wait_while_paused(cancel: &AtomicBool, paused: &AtomicBool) {
     }
 }
 
+/// Kill and reap each child. Calling `kill` alone leaves a zombie until the
+/// process is waited on, so cancellation and shutdown both wait here.
 fn kill_all(children: &Children) {
     if let Ok(mut list) = children.lock() {
         for child in list.iter_mut() {
             let _ = child.kill();
+            let _ = child.wait();
         }
     }
 }
@@ -348,7 +351,7 @@ struct TempAudio(PathBuf, bool);
 impl Drop for TempAudio {
     fn drop(&mut self) {
         if self.1 {
-            let _ = std::fs::remove_file(&self.0);
+            crate::fetch::cleanup_audio(&self.0);
         }
     }
 }
@@ -383,6 +386,7 @@ fn pipeline(
     };
     let _temp = TempAudio(decoded_source.clone(), url);
     let _ = tx.send(Event::Info { title, duration });
+    wait_while_paused(cancel, paused);
     if cancel.load(Ordering::Relaxed) {
         return Ok(());
     }
@@ -400,6 +404,7 @@ fn pipeline(
         .create_state()
         .map_err(|e| format!("could not create a whisper inference state: {e}"))?;
     let multilingual = ctx.is_multilingual();
+    wait_while_paused(cancel, paused);
     if cancel.load(Ordering::Relaxed) {
         return Ok(());
     }
@@ -415,22 +420,21 @@ fn pipeline(
     }
 
     let _ = tx.send(Event::Stage(Stage::Transcribing));
-    let lang: &'static str = if multilingual {
-        Box::leak(
-            job.lang
-                .clone()
-                .unwrap_or_else(|| "auto".into())
-                .into_boxed_str(),
-        )
+    // borrow a local String into FullParams instead of leaking it: repeated
+    // transcription jobs used to allocate a permanent 'static str per job.
+    let lang: String = if multilingual {
+        job.lang.clone().unwrap_or_else(|| "auto".into())
     } else {
-        "en"
+        "en".into()
     };
 
     let mut buf: Vec<f32> = Vec::new();
     let mut base = 0usize;
     let mut cursor = 0usize;
     let mut eof = false;
-    let mut last_emitted: Option<Segment> = None;
+    // only the text and end of the last emitted cue are needed to suppress
+    // overlap duplicates; keeping a whole Segment clone per window was wasteful.
+    let mut last_emitted: Option<(String, i64)> = None;
 
     loop {
         wait_while_paused(cancel, paused);
@@ -473,7 +477,7 @@ fn pipeline(
         let _ = tx.send(Event::Envelope(envelope(&window[..n], ENVELOPE_BUCKETS)));
         let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
         params.set_n_threads(job.threads);
-        params.set_language(Some(lang));
+        params.set_language(Some(lang.as_str()));
         params.set_translate(job.translate && multilingual);
         params.set_print_special(false);
         params.set_print_progress(false);
@@ -561,9 +565,9 @@ fn pipeline(
             }
             let duplicate = last_emitted
                 .as_ref()
-                .is_some_and(|p| p.text == seg.text && seg.start_cs < p.end_cs);
-            if !duplicate {
-                last_emitted = Some(seg.clone());
+                .is_some_and(|(text, end)| *text == seg.text && seg.start_cs < *end);
+            if !duplicate && seg.end_cs > seg.start_cs {
+                last_emitted = Some((seg.text.clone(), seg.end_cs));
                 let _ = tx.send(Event::Segment(seg));
             }
         }
@@ -700,6 +704,52 @@ mod tests {
         assert!(!is_speech_text("  "));
         assert!(!is_speech_text("[BLANK_AUDIO]"));
         assert!(is_speech_text("hello"));
+    }
+
+    #[test]
+    fn worker_reports_missing_model_without_hanging() {
+        let (tx, rx) = mpsc::channel();
+        let job = Job {
+            source: "/definitely/missing.wav".into(),
+            model: PathBuf::from("/definitely/missing-model.bin"),
+            threads: 1,
+            lang: None,
+            translate: false,
+        };
+        let handle = spawn(job, tx);
+        // drain stage events until the terminal one. a hang here would be a
+        // stuck worker thread that never reports success, failure or cancel.
+        let mut terminal = false;
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while std::time::Instant::now() < deadline {
+            match rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(Event::Error(_) | Event::Cancelled | Event::Done) => {
+                    terminal = true;
+                    break;
+                }
+                Ok(_) => {}
+                Err(_) => {}
+            }
+        }
+        assert!(terminal, "worker never produced a terminal event");
+        // dropping the handle must not panic or double-kill
+        drop(handle);
+    }
+
+    #[test]
+    fn handle_cancel_is_idempotent() {
+        let (tx, _rx) = mpsc::channel();
+        let job = Job {
+            source: "/definitely/missing.wav".into(),
+            model: PathBuf::from("/definitely/missing-model.bin"),
+            threads: 1,
+            lang: None,
+            translate: false,
+        };
+        let handle = spawn(job, tx);
+        handle.cancel();
+        handle.cancel();
+        drop(handle);
     }
 
     #[test]

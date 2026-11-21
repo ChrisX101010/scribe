@@ -1,7 +1,7 @@
 //! the transcript record and the five ways to write it out.
 //!
-//! pure formatting, no file handles. this is why i can test subtitle timing
-//! without creating a single temp file, and why export bugs stay in this file.
+//! pure formatting, no file handles. subtitle cues are built from one ordered
+//! list so segment-level and word-level output never overlap or duplicate.
 
 use crate::util::{is_youtube_url, timestamp_cs, youtube_link};
 use std::fmt::Write as _;
@@ -68,6 +68,62 @@ fn srt_time(cs: i64) -> String {
     timestamp_cs(cs).replace('.', ",")
 }
 
+/// subtitle cue with centisecond timestamps and a single line of text.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Cue {
+    start_cs: i64,
+    end_cs: i64,
+    text: String,
+}
+
+/// Build the cue list for subtitle formats. When a segment carries word
+/// timings, those words become the cues; otherwise the segment itself is one
+/// cue. The result is sorted by start time, free of zero-length cues, and
+/// clamped so no cue overlaps the previous one.
+fn cues(segments: &[Segment]) -> Vec<Cue> {
+    let mut out: Vec<Cue> = Vec::new();
+    for seg in segments {
+        if !seg.words.is_empty() {
+            for word in &seg.words {
+                let text = word.text.trim();
+                if !text.is_empty() && word.end_cs > word.start_cs {
+                    out.push(Cue {
+                        start_cs: word.start_cs,
+                        end_cs: word.end_cs,
+                        text: clean_cue_text(text),
+                    });
+                }
+            }
+        } else {
+            let text = seg.text.trim();
+            if !text.is_empty() && seg.end_cs > seg.start_cs {
+                out.push(Cue {
+                    start_cs: seg.start_cs,
+                    end_cs: seg.end_cs,
+                    text: clean_cue_text(text),
+                });
+            }
+        }
+    }
+    out.sort_by(|a, b| a.start_cs.cmp(&b.start_cs).then(a.end_cs.cmp(&b.end_cs)));
+    for i in 1..out.len() {
+        if out[i].start_cs < out[i - 1].end_cs {
+            out[i].start_cs = out[i - 1].end_cs;
+        }
+    }
+    out.retain(|c| c.end_cs > c.start_cs);
+    out
+}
+
+/// Subtitle text must stay on one line and cannot contain a blank line or a
+/// timing arrow. Newlines inside a whisper segment are flattened to spaces.
+fn clean_cue_text(text: &str) -> String {
+    text.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .replace("-->", "→")
+}
+
 pub fn to_txt(segments: &[Segment]) -> String {
     let mut text = String::new();
     for seg in segments {
@@ -82,63 +138,34 @@ pub fn to_txt(segments: &[Segment]) -> String {
 }
 
 pub fn to_srt(segments: &[Segment]) -> String {
+    let cues = cues(segments);
     let mut text = String::new();
-    let mut n = 0;
-    for seg in segments {
-        n += 1;
-        let _ = writeln!(text, "{n}");
+    for (i, cue) in cues.iter().enumerate() {
+        let _ = writeln!(text, "{}", i + 1);
         let _ = writeln!(
             text,
             "{} --> {}",
-            srt_time(seg.start_cs),
-            srt_time(seg.end_cs)
+            srt_time(cue.start_cs),
+            srt_time(cue.end_cs)
         );
-        let _ = writeln!(text, "{}", seg.text);
+        let _ = writeln!(text, "{}", cue.text);
         let _ = writeln!(text);
-        for word in &seg.words {
-            if word.end_cs > word.start_cs {
-                n += 1;
-                let _ = writeln!(text, "{n}");
-                let _ = writeln!(
-                    text,
-                    "{} --> {}",
-                    srt_time(word.start_cs),
-                    srt_time(word.end_cs)
-                );
-                let _ = writeln!(text, "{}", word.text);
-                let _ = writeln!(text);
-            }
-        }
     }
     text
 }
 
 pub fn to_vtt(segments: &[Segment]) -> String {
-    let mut text = String::from("webvtt\n\n");
-    for seg in segments {
+    let cues = cues(segments);
+    let mut text = String::from("WEBVTT\n\n");
+    for cue in &cues {
         let _ = writeln!(
             text,
             "{} --> {}",
-            timestamp_cs(seg.start_cs),
-            timestamp_cs(seg.end_cs)
+            timestamp_cs(cue.start_cs),
+            timestamp_cs(cue.end_cs)
         );
-        let _ = writeln!(text, "{}", seg.text);
+        let _ = writeln!(text, "{}", cue.text);
         let _ = writeln!(text);
-        if !seg.words.is_empty() {
-            text.push_str("note word timings\n\n");
-            for word in &seg.words {
-                if word.end_cs > word.start_cs {
-                    let _ = writeln!(
-                        text,
-                        "{} --> {}",
-                        timestamp_cs(word.start_cs),
-                        timestamp_cs(word.end_cs)
-                    );
-                    let _ = writeln!(text, "{}", word.text);
-                    let _ = writeln!(text);
-                }
-            }
-        }
     }
     text
 }
@@ -252,6 +279,14 @@ mod tests {
         ]
     }
 
+    fn word(start_cs: i64, end_cs: i64, text: &str) -> Word {
+        Word {
+            start_cs,
+            end_cs,
+            text: text.into(),
+        }
+    }
+
     #[test]
     fn srt_format() {
         let s = to_srt(&sample());
@@ -262,7 +297,7 @@ mod tests {
     #[test]
     fn vtt_format() {
         let s = to_vtt(&sample());
-        assert!(s.starts_with("webvtt\n\n"));
+        assert!(s.starts_with("WEBVTT\n\n"));
         assert!(s.contains("00:00:00.000 --> 00:00:02.500"));
     }
 
@@ -292,27 +327,78 @@ mod tests {
     #[test]
     fn word_timestamps_export() {
         let mut seg = Segment::new(0, 100, "hello world".into());
-        seg.words = vec![
-            Word {
-                start_cs: 0,
-                end_cs: 40,
-                text: "hello".into(),
-            },
-            Word {
-                start_cs: 45,
-                end_cs: 100,
-                text: "world".into(),
-            },
-        ];
+        seg.words = vec![word(0, 40, "hello"), word(45, 100, "world")];
         let srt = to_srt(&[seg.clone()]);
         assert!(srt.contains("00:00:00,000 --> 00:00:00,400\nhello"));
         assert!(srt.contains("00:00:00,450 --> 00:00:01,000\nworld"));
+        // only word cues: no overlapping segment cue is emitted
+        assert!(!srt.contains("00:00:01,000\nhello world"));
         let vtt = to_vtt(&[seg.clone()]);
-        assert!(vtt.contains("note word timings"));
+        assert!(!vtt.contains("note word timings"));
+        assert!(vtt.contains("00:00:00.000 --> 00:00:00.400\nhello"));
         let json = to_json(&[seg.clone()]);
         assert!(json.contains("\"words\": [{\"start\": 0, \"end\": 40, \"text\": \"hello\"}"));
         let md = to_md(&[seg], Some("https://youtu.be/abc123"));
         assert!(md.contains("[hello](https://www.youtube.com/watch?v=abc123&t=0s)"));
         assert!(md.contains("[world](https://www.youtube.com/watch?v=abc123&t=0s)"));
+    }
+
+    #[test]
+    fn cues_are_sorted_clamped_and_deduplicated() {
+        let segments = vec![
+            Segment {
+                start_cs: 300,
+                end_cs: 500,
+                text: "third".into(),
+                words: vec![],
+            },
+            Segment {
+                start_cs: 0,
+                end_cs: 200,
+                text: "first\nline".into(),
+                words: vec![],
+            },
+            Segment {
+                start_cs: 150,
+                end_cs: 350,
+                text: "second".into(),
+                words: vec![],
+            },
+        ];
+        let c = cues(&segments);
+        assert_eq!(c.len(), 3);
+        assert_eq!(c[0].start_cs, 0);
+        assert!(c[0].text == "first line", "text should be one line");
+        assert!(c[1].start_cs >= c[0].end_cs, "no overlap");
+        assert!(c[2].start_cs >= c[1].end_cs, "no overlap");
+    }
+
+    #[test]
+    fn empty_and_invalid_cues_are_skipped() {
+        let segments = vec![
+            Segment::new(0, 100, "".into()),
+            Segment::new(100, 100, "zero length".into()),
+            Segment::new(200, 150, "backwards".into()),
+        ];
+        assert!(cues(&segments).is_empty());
+        assert_eq!(to_srt(&segments), "");
+        assert_eq!(to_vtt(&segments), "WEBVTT\n\n");
+    }
+
+    #[test]
+    fn subtitle_text_escapes_arrows() {
+        let segments = vec![Segment::new(0, 100, "a --> b".into())];
+        let srt = to_srt(&segments);
+        assert!(srt.contains("a → b"));
+        assert!(
+            !srt.contains("a --> b\n"),
+            "arrow in text must be sanitized"
+        );
+    }
+
+    #[test]
+    fn long_recording_timestamps_have_hours() {
+        let s = to_srt(&[Segment::new(3_661_234, 3_661_334, "late".into())]);
+        assert!(s.contains("10:10:12,340 --> 10:10:13,340"));
     }
 }

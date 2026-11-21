@@ -14,7 +14,7 @@ use std::time::Instant;
 
 pub const BASE_URL: &str = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main";
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ModelInfo {
     pub key: &'static str,
     pub file: &'static str,
@@ -423,42 +423,88 @@ pub fn cache_dir() -> PathBuf {
         .join("models")
 }
 
-/// --model path wins, then a catalog name, then whatever is already cached.
-/// that last part means you can download a model once and forget about flags.
-pub fn resolve(
-    arg: Option<&Path>,
-    configured_name: Option<&str>,
-) -> Result<(String, PathBuf), String> {
-    if let Some(p) = arg {
-        let p = expand_tilde(&p.to_string_lossy());
-        if !p.is_file() {
-            return Err(format!(
-                "no model file at {}. pass a real path, or pick a catalog name in the tui",
-                p.display()
-            ));
-        }
-        let label = p
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| "custom".into());
-        return Ok((label, p));
+/// What a `--model`/saved value can refer to. Keeping the three forms distinct
+/// is what makes resolution unambiguous: a catalog name is never also treated
+/// as a path just because a file with that name happens to exist in `$PWD`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ModelRef {
+    Catalog(&'static ModelInfo),
+    Path(PathBuf),
+}
+
+/// classify a model string. a bare catalog key (or its `ggml-*.bin` filename)
+/// wins; anything that looks like a path is a path. unknown bare names are
+/// rejected here so callers can report them instead of guessing.
+pub fn classify(input: &str) -> Result<ModelRef, String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Err("empty model name".into());
     }
-    let dir = cache_dir();
-    if let Some(name) = configured_name {
-        if let Some(info) = find(name) {
-            let path = dir.join(info.file);
+    let path_like = trimmed.contains('/')
+        || trimmed.contains('\\')
+        || trimmed.starts_with('.')
+        || trimmed.starts_with('~');
+    if !path_like {
+        let key = trimmed
+            .strip_prefix("ggml-")
+            .and_then(|s| s.strip_suffix(".bin"))
+            .unwrap_or(trimmed);
+        if let Some(info) = find(key) {
+            return Ok(ModelRef::Catalog(info));
+        }
+        // unknown bare name: do not fall back to a path in cwd.
+        let suggestion = default_model().key;
+        return Err(format!(
+            "unknown model '{trimmed}'. use a catalog name (try '{suggestion}') or pass a path to a .bin file"
+        ));
+    }
+    let path = expand_tilde(trimmed);
+    if !path.is_file() {
+        return Err(format!("no model file at {}", path.display()));
+    }
+    Ok(ModelRef::Path(path))
+}
+
+/// Resolve a single model reference to a usable file. `None` means "use the
+/// first cached model", which keeps the old no-flags workflow working.
+pub fn resolve(input: Option<&str>) -> Result<(String, PathBuf), String> {
+    let Some(input) = input else {
+        return resolve_cached();
+    };
+    match classify(input)? {
+        ModelRef::Catalog(info) => {
+            let path = cache_dir().join(info.file);
             if path.is_file() {
-                return Ok((info.label.to_string(), path));
+                let actual = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                if actual < min_size(info) {
+                    return Err(format!(
+                        "{} looks incomplete ({} of {} MiB). remove it from the model picker and download it again",
+                        info.key,
+                        actual / (1024 * 1024),
+                        info.size_mib
+                    ));
+                }
+                Ok((info.label.to_string(), path))
+            } else {
+                Err(format!(
+                    "{} is a valid model but is not downloaded yet ({} MiB). open the model picker with m, or pass --model <path>",
+                    info.key, info.size_mib
+                ))
             }
-            return Err(format!(
-                "{name} is not downloaded yet. open the model picker with m, or pass --model <path>"
-            ));
         }
-        let path = expand_tilde(name);
-        if path.is_file() {
-            return Ok((name.to_string(), path));
+        ModelRef::Path(path) => {
+            let label = path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| "custom".into());
+            Ok((label, path))
         }
     }
+}
+
+/// First cached catalog model, in catalog order. Used when no model was given.
+pub fn resolve_cached() -> Result<(String, PathBuf), String> {
+    let dir = cache_dir();
     for info in CATALOG {
         let path = dir.join(info.file);
         if path.is_file() {
@@ -534,6 +580,31 @@ fn sha256_of(path: &Path) -> Result<String, String> {
         .collect())
 }
 
+/// Verify a completed model against its catalog size and sha256. Used by the
+/// downloader before committing a file, and available for explicit checks.
+pub fn verify_model(info: &ModelInfo, path: &Path) -> Result<(), String> {
+    let actual = fs::metadata(path)
+        .map_err(|e| format!("cannot inspect model {}: {e}", path.display()))?
+        .len();
+    if actual < min_size(info) {
+        return Err(format!(
+            "incomplete model: got {} of {} MiB",
+            actual / (1024 * 1024),
+            info.size_mib
+        ));
+    }
+    let got = sha256_of(path)?;
+    if got != info.sha {
+        return Err(format!(
+            "checksum mismatch for {} (got {}, expected {})",
+            info.file,
+            &got[..got.len().min(12)],
+            &info.sha[..info.sha.len().min(12)]
+        ));
+    }
+    Ok(())
+}
+
 pub fn partial_size(info: &ModelInfo) -> Option<u64> {
     let part = cache_dir().join(format!("{}.part", info.file));
     fs::metadata(&part).map(|m| m.len()).ok().filter(|l| *l > 0)
@@ -569,20 +640,27 @@ pub fn remove_model(info: &ModelInfo) -> Result<(), String> {
 
 /// download to a .part file, verify size and sha256, then rename. the rename is
 /// the commit point: until then, nothing in the cache claims to be a model.
-///
-/// servers sometimes ignore range requests. fine, we start over. this is why
-/// the result never depends on range support, and why we retry three times.
-/// trusting a half-downloaded model is how you get silent garbage output.
 pub fn download(
     info: &ModelInfo,
     cancel: &std::sync::Arc<std::sync::atomic::AtomicBool>,
     on_progress: impl Fn(DownloadProgress),
 ) -> Result<PathBuf, String> {
-    let dir = cache_dir();
+    download_from(info, BASE_URL, cache_dir(), cancel, on_progress)
+}
+
+/// same as `download`, with an injectable base url and cache directory so
+/// failure and interrupt paths can be tested against a local server.
+fn download_from(
+    info: &ModelInfo,
+    base_url: &str,
+    dir: PathBuf,
+    cancel: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    on_progress: impl Fn(DownloadProgress),
+) -> Result<PathBuf, String> {
     fs::create_dir_all(&dir).map_err(|e| format!("cannot create model directory: {e}"))?;
     let final_path = dir.join(info.file);
     let part = dir.join(format!("{}.part", info.file));
-    let url = format!("{BASE_URL}/{}", info.file);
+    let url = format!("{}/{}", base_url.trim_end_matches('/'), info.file);
     let mut last_error = String::from("download failed before any bytes were written");
 
     for _attempt in 0..3 {
@@ -597,7 +675,14 @@ pub fn download(
             existing = 0;
         }
 
-        let mut request = ureq::get(&url);
+        // bounded socket timeouts: a stalled server must not hold cancellation
+        // hostage. a read timeout restarts the attempt from the saved partial.
+        let agent = ureq::Agent::config_builder()
+            .timeout_connect(Some(std::time::Duration::from_secs(10)))
+            .timeout_per_read(Some(std::time::Duration::from_secs(8)))
+            .build()
+            .new_agent();
+        let mut request = agent.get(&url);
         if existing > 0 {
             request = request.header("Range", &format!("bytes={existing}-"));
         }
@@ -687,11 +772,6 @@ pub fn download(
         drop(file);
 
         let actual = fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
-        if actual < min_size(info) {
-            last_error = format!("incomplete download: got {}", human_bytes(actual));
-            let _ = fs::remove_file(&part);
-            continue;
-        }
         if let Some(expected) = total
             && actual != expected
         {
@@ -703,14 +783,8 @@ pub fn download(
             let _ = fs::remove_file(&part);
             continue;
         }
-        let got = sha256_of(&part)?;
-        if got != info.sha {
-            last_error = format!(
-                "checksum mismatch for {} (got {}, expected {}); the file was removed, retry the download",
-                info.file,
-                &got[..got.len().min(12)],
-                &info.sha[..info.sha.len().min(12)]
-            );
+        if let Err(e) = verify_model(info, &part) {
+            last_error = format!("{e}; the file was removed, retry the download");
             let _ = fs::remove_file(&part);
             continue;
         }
@@ -816,5 +890,251 @@ mod tests {
     fn cache_path_uses_xdg() {
         let p = cache_dir();
         assert!(p.ends_with("scribe/models") || p.ends_with("scribe\\models"));
+    }
+
+    #[test]
+    fn classify_accepts_every_catalog_key() {
+        for info in CATALOG {
+            assert_eq!(
+                classify(info.key).unwrap(),
+                ModelRef::Catalog(info),
+                "key {}",
+                info.key
+            );
+            assert_eq!(
+                classify(info.file).unwrap(),
+                ModelRef::Catalog(info),
+                "file {}",
+                info.file
+            );
+        }
+    }
+
+    #[test]
+    fn classify_rejects_unknown_and_empty_names() {
+        assert!(classify("not-a-model").is_err());
+        assert!(classify("   ").is_err());
+        let err = classify("tiny-typo").unwrap_err();
+        assert!(err.contains("unknown model") && err.contains("small-q5_1"));
+    }
+
+    #[test]
+    fn classify_treats_paths_as_paths() {
+        let dir = std::env::temp_dir().join(format!("scribe-model-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let file = dir.join("custom-ggml.bin");
+        fs::write(&file, b"not a real model").unwrap();
+        match classify(file.to_str().unwrap()).unwrap() {
+            ModelRef::Path(p) => assert_eq!(p, file),
+            other => panic!("expected path, got {other:?}"),
+        }
+        // a path-like name that does not exist is an error, not a catalog lookup
+        assert!(classify("./definitely-missing.bin").is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_path_form_returns_label_and_path() {
+        let dir = std::env::temp_dir().join(format!("scribe-resolve-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let file = dir.join("my-voice.bin");
+        fs::write(&file, b"x").unwrap();
+        let (label, path) = resolve(Some(file.to_str().unwrap())).unwrap();
+        assert_eq!(label, "my-voice.bin");
+        assert_eq!(path, file);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn tiny_info(sha: &'static str) -> ModelInfo {
+        ModelInfo {
+            key: "test",
+            file: "ggml-test.bin",
+            label: "test",
+            size_mib: 0,
+            ram_mib: 1,
+            speed: "fast",
+            note: "test",
+            sha,
+            multilingual: true,
+        }
+    }
+
+    /// minimal single-request http server. `mode` controls what it sends so
+    /// success, checksum failure and mid-stream interruption are all
+    /// deterministic and never touch the public internet.
+    fn serve_once(body: &[u8], mode: &str) -> (String, std::thread::JoinHandle<()>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let body = body.to_vec();
+        let mode = mode.to_string();
+        let handle = std::thread::spawn(move || {
+            // serve several attempts: the downloader retries up to 3 times.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            for _ in 0..4 {
+                let mut stream = loop {
+                    if std::time::Instant::now() > deadline {
+                        return;
+                    }
+                    match listener.accept() {
+                        Ok((s, _)) => break s,
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                        }
+                        Err(_) => return,
+                    }
+                };
+                let mut request = [0u8; 2048];
+                let n = stream.read(&mut request).unwrap_or(0);
+                let req = String::from_utf8_lossy(&request[..n]);
+                match mode.as_str() {
+                    "ok" => {
+                        let header = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        );
+                        stream.write_all(header.as_bytes()).unwrap();
+                        stream.write_all(&body).unwrap();
+                    }
+                    "short" => {
+                        // announce a full file but send only half, then disconnect
+                        let header = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        );
+                        stream.write_all(header.as_bytes()).unwrap();
+                        stream.write_all(&body[..body.len() / 2]).unwrap();
+                    }
+                    "range-ok" => {
+                        let start = req
+                            .lines()
+                            .find_map(|l| l.strip_prefix("Range: bytes="))
+                            .and_then(|s| s.trim().split('-').next())
+                            .and_then(|s| s.parse::<usize>().ok())
+                            .unwrap_or(0);
+                        let payload = &body[start..];
+                        let header = format!(
+                            "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            payload.len()
+                        );
+                        stream.write_all(header.as_bytes()).unwrap();
+                        stream.write_all(payload).unwrap();
+                    }
+                    _ => {}
+                }
+                let _ = stream.flush();
+            }
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    #[test]
+    fn download_succeeds_and_commits_verified_file() {
+        let body = b"hello";
+        let info = tiny_info("2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824");
+        let (url, server) = serve_once(body, "ok");
+        let dir = std::env::temp_dir().join(format!("scribe-dl-ok-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let result = download_from(&info, &url, dir.clone(), &cancel, |_| {});
+        server.join().unwrap();
+        let path = result.unwrap();
+        assert_eq!(path, dir.join(info.file));
+        assert_eq!(fs::read(&path).unwrap(), body);
+        assert!(!dir.join(format!("{}.part", info.file)).exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn download_rejects_checksum_mismatch() {
+        let info = tiny_info("0000000000000000000000000000000000000000000000000000000000000000");
+        let (url, server) = serve_once(b"hello", "ok");
+        let dir = std::env::temp_dir().join(format!("scribe-dl-sha-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // the server only answers once; the three attempts all fail, which is
+        // exactly what we want to observe.
+        let err = download_from(&info, &url, dir.clone(), &cancel, |_| {}).unwrap_err();
+        server.join().unwrap();
+        assert!(err.contains("checksum mismatch") || err.contains("download failed"));
+        assert!(
+            !dir.join(info.file).exists(),
+            "bad file must not be committed"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn interrupted_download_is_never_committed() {
+        let info = tiny_info("2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824");
+        let (url, server) = serve_once(b"hello world", "short");
+        let dir = std::env::temp_dir().join(format!("scribe-dl-short-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let err = download_from(&info, &url, dir.clone(), &cancel, |_| {}).unwrap_err();
+        server.join().unwrap();
+        assert!(
+            err.contains("size mismatch")
+                || err.contains("read failed")
+                || err.contains("download failed"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            !dir.join(info.file).exists(),
+            "truncated file must not be committed"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cancelled_download_leaves_no_committed_file() {
+        let info = tiny_info("2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824");
+        let (url, server) = serve_once(b"hello", "ok");
+        let dir = std::env::temp_dir().join(format!("scribe-dl-cancel-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let err = download_from(&info, &url, dir.clone(), &cancel, |_| {}).unwrap_err();
+        server.join().unwrap();
+        assert!(err.contains("paused") || err.contains("cancelled"));
+        assert!(!dir.join(info.file).exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn verify_model_checks_sha_and_size() {
+        let info = ModelInfo {
+            key: "test",
+            file: "ggml-test.bin",
+            label: "test",
+            size_mib: 0,
+            ram_mib: 1,
+            speed: "fast",
+            note: "test",
+            sha: "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+            multilingual: true,
+        };
+        let dir = std::env::temp_dir().join(format!("scribe-verify-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let file = dir.join("ggml-test.bin");
+        fs::write(&file, b"hello").unwrap();
+        assert!(verify_model(&info, &file).is_ok());
+        fs::write(&file, b"world").unwrap();
+        let err = verify_model(&info, &file).unwrap_err();
+        assert!(err.contains("checksum mismatch"));
+        fs::remove_file(&file).unwrap();
+        assert!(verify_model(&info, &file).is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_catalog_name_without_download_gives_actionable_error() {
+        // use a key that is extremely unlikely to be cached on a test runner
+        let key = "large-v1";
+        if cache_dir().join(find(key).unwrap().file).is_file() {
+            return;
+        }
+        let err = resolve(Some(key)).unwrap_err();
+        assert!(err.contains("not downloaded") && err.contains("2969"));
     }
 }

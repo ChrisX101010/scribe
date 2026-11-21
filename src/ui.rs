@@ -172,6 +172,7 @@ fn render_compact_status(f: &mut Frame, area: Rect, app: &App) {
 /// through the overlay on the alternate screen. borders and text are drawn
 /// afterwards as usual.
 fn clear_transparent(buf: &mut Buffer, area: Rect) {
+    let area = area.intersection(buf.area);
     for y in area.top()..area.bottom() {
         for x in area.left()..area.right() {
             let cell = &mut buf[(x, y)];
@@ -185,6 +186,7 @@ fn clear_transparent(buf: &mut Buffer, area: Rect) {
 }
 
 fn fill_blank(buf: &mut Buffer, area: Rect, style: Style) {
+    let area = area.intersection(buf.area);
     for y in area.top()..area.bottom() {
         for x in area.left()..area.right() {
             let cell = &mut buf[(x, y)];
@@ -872,8 +874,13 @@ fn render_completion_popup(f: &mut Frame, input_area: Rect, app: &App) {
         return;
     }
 
-    let popup_w = input_area.width.clamp(24, 72);
-    let x = input_area.x;
+    // never let the popup exceed the visible canvas: a clamped 24-column
+    // minimum used to write past the right edge of a 20-column terminal.
+    let popup_w = input_area.width.min(72).min(f.area.width);
+    if popup_w == 0 {
+        return;
+    }
+    let x = input_area.x.min(f.area.right().saturating_sub(popup_w));
     let y = input_area.y.saturating_sub(popup_h);
     let popup = Rect::new(x, y, popup_w, popup_h);
 
@@ -1208,7 +1215,8 @@ fn render_help(f: &mut Frame) {
                     "enter",
                     "start  (or resume when paused / accept completion)",
                 ),
-                ("esc / space / p", "pause active job  (again resumes)"),
+                ("esc", "pause active job  (again stops it)"),
+                ("space / p", "pause or resume the active job"),
                 ("c", "stop active job  (keeps saved segments)"),
                 ("m", "open model picker"),
                 ("s", "open settings"),
@@ -1293,6 +1301,9 @@ fn render_theme_picker(f: &mut Frame, app: &App) {
 
     let themes = crate::theme::ThemeKind::ALL;
     let selected = app.theme_index.min(themes.len().saturating_sub(1));
+    let Some(selected_theme) = themes.get(selected) else {
+        return;
+    };
     let page_rows = inner.height as usize;
     let start = selected.saturating_sub(page_rows.saturating_sub(1) / 2);
     let end = (start + page_rows).min(themes.len());
@@ -1344,7 +1355,7 @@ fn render_theme_picker(f: &mut Frame, app: &App) {
     }
     if inner.height > 1 {
         let caption_y = inner.y + inner.height - 1;
-        let caption = themes[selected].description();
+        let caption = selected_theme.description();
         Span::styled(
             truncate(caption, inner.width as usize),
             Style::default().fg(f.palette.muted),
@@ -2010,4 +2021,85 @@ fn render_message(f: &mut Frame, app: &App) {
         ),
         f.buf,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cli::Args;
+    use crate::export::Segment;
+    use crate::theme::{ColorDepth, ThemeKind};
+
+    fn render_at(width: u16, height: u16, overlay: Overlay, segments: usize) -> Buffer {
+        let mut app = App::new(&Args::default());
+        app.overlay = overlay;
+        app.completion.candidates = vec![crate::util::CompletionCandidate {
+            value: "some-long-file-name.wav".into(),
+            label: "some-long-file-name.wav".into(),
+            dir: "/tmp/".into(),
+            is_dir: false,
+            score: 0,
+        }];
+        app.completion.selected = 0;
+        app.input = "/tmp/some-long-file-name.wav".into();
+        app.message = "a reasonably long notice that must wrap without overflowing".into();
+        for i in 0..segments {
+            app.on_segment(Segment::new(
+                i as i64 * 250,
+                (i as i64 + 1) * 250,
+                "a fairly long transcription segment that will need to wrap on narrow terminals"
+                    .into(),
+            ));
+        }
+        let mut buf = Buffer::empty(Rect::new(0, 0, width, height));
+        let palette = crate::theme::palette(ThemeKind::CatppuccinMocha, ColorDepth::Truecolor);
+        render(&mut buf, Rect::new(0, 0, width, height), &mut app, palette);
+        buf
+    }
+
+    #[test]
+    fn renders_at_every_layout_size_without_panicking() {
+        for (w, h) in [
+            (4, 2),
+            (19, 5),
+            (20, 6),
+            (24, 8),
+            (39, 12),
+            (40, 13),
+            (80, 24),
+            (92, 16),
+            (160, 50),
+        ] {
+            for overlay in [
+                Overlay::None,
+                Overlay::Help,
+                Overlay::Settings,
+                Overlay::ModelPicker,
+                Overlay::ThemePicker,
+                Overlay::Export,
+                Overlay::Search,
+                Overlay::Message,
+            ] {
+                let buf = render_at(w, h, overlay, 5);
+                assert_eq!(buf.area.width, w);
+                assert_eq!(buf.area.height, h);
+            }
+        }
+    }
+
+    #[test]
+    fn content_stays_inside_the_buffer_after_resize() {
+        // a narrow render followed by a wide one must not leave stale glyphs
+        // outside the new area or corrupt the app state.
+        let _narrow = render_at(24, 8, Overlay::ModelPicker, 20);
+        let wide = render_at(160, 50, Overlay::ModelPicker, 20);
+        assert!(wide.content.iter().any(|c| c.symbol() != " "));
+    }
+
+    #[test]
+    fn picker_visible_rows_is_bounded() {
+        assert_eq!(picker_visible_rows(10, false), 4);
+        assert_eq!(picker_visible_rows(10, true), 3);
+        assert_eq!(picker_visible_rows(3, true), 0);
+    }
 }

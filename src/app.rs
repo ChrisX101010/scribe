@@ -500,12 +500,17 @@ impl App {
         self.follow = true;
         self.progress = 0.0;
         self.progress_smooth = 0.0;
+        self.envelope.fill(0.0);
+        self.envelope_smooth.fill(0.0);
         self.done_seconds = 0.0;
         self.started = None;
         self.finished_at = None;
         self.paused_at = None;
         self.pending_resume = false;
         self.paused_total = 0.0;
+        self.query.clear();
+        self.matches.clear();
+        self.match_idx = 0;
         self.status = Status::Fetching;
         self.stage_started = Instant::now();
         self.overlay = Overlay::None;
@@ -970,6 +975,42 @@ mod tests {
         app.on_progress(28.0);
         assert_eq!(app.done_seconds, 30.0);
         assert_eq!(app.progress, 0.5);
+    }
+
+    #[test]
+    fn repeated_jobs_do_not_retain_stale_state() {
+        let mut app = App::new(&Args::default());
+        app.status = Status::Transcribing;
+        app.on_segment(Segment::new(0, 100, "old".into()));
+        app.done_seconds = 42.0;
+        app.progress = 0.8;
+        app.query = "old".into();
+        app.recompute_search();
+        app.finished_at = Some(Instant::now());
+
+        app.start();
+        assert!(app.segments.is_empty());
+        assert_eq!(app.done_seconds, 0.0);
+        assert_eq!(app.progress, 0.0);
+        assert!(app.finished_at.is_none());
+        assert!(app.follow);
+        assert!(app.query.is_empty());
+        assert!(app.matches.is_empty());
+    }
+
+    #[test]
+    fn cancel_after_pause_settles_clock() {
+        let mut app = App::new(&Args::default());
+        app.status = Status::Transcribing;
+        app.started = Some(Instant::now() - std::time::Duration::from_secs(5));
+        app.pause();
+        assert!(app.pending_resume);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        app.on_cancelled();
+        assert!(!app.pending_resume);
+        assert!(app.paused_at.is_none());
+        assert_eq!(app.status, Status::Cancelled);
+        assert!(app.elapsed_s() <= 5.5, "paused time should be excluded");
     }
 
     #[test]

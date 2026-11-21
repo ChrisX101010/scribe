@@ -163,10 +163,7 @@ fn run_plain(args: &Args) -> Result<String, String> {
     let source = args.input.as_ref().ok_or("give me a file path or a url")?;
     let need = util::is_url(source);
     worker::check_tools(need)?;
-    let (_, path) = model::resolve(
-        args.model.as_deref(),
-        args.model.as_deref().and_then(|p| p.to_str()),
-    )?;
+    let (_, path) = model::resolve(args.model.as_deref().and_then(|p| p.to_str()))?;
     let threads = args.threads.unwrap_or_else(|| {
         std::thread::available_parallelism()
             .map(|n| n.get() as i32)
@@ -224,10 +221,7 @@ fn run_tui(args: &Args) -> Result<(), String> {
     let depth = theme::detect_depth();
     let mut app = App::new(args);
 
-    let (label, path) = match model::resolve(
-        args.model.as_deref(),
-        args.model.as_deref().and_then(|p| p.to_str()),
-    ) {
+    let (label, path) = match model::resolve(args.model.as_deref().and_then(|p| p.to_str())) {
         Ok((l, p)) => (l, p),
         Err(e) => {
             app.set_message(e);
@@ -496,11 +490,17 @@ fn process_key(
                 }
                 KeyCode::Up | KeyCode::Char('k') => {
                     app.theme_index = app.theme_index.saturating_sub(1);
-                    app.theme = theme::ThemeKind::ALL[app.theme_index];
+                    app.theme = theme::ThemeKind::ALL
+                        .get(app.theme_index)
+                        .copied()
+                        .unwrap_or(theme::ThemeKind::CatppuccinMocha);
                 }
                 KeyCode::Down | KeyCode::Char('j') => {
                     app.theme_index = (app.theme_index + 1).min(theme::ThemeKind::ALL.len() - 1);
-                    app.theme = theme::ThemeKind::ALL[app.theme_index];
+                    app.theme = theme::ThemeKind::ALL
+                        .get(app.theme_index)
+                        .copied()
+                        .unwrap_or(theme::ThemeKind::CatppuccinMocha);
                 }
                 _ => {}
             },
@@ -861,17 +861,20 @@ fn start_download(
     download_rx: &mut Option<Receiver<model::DownloadProgress>>,
     download_cancel: &mut Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) {
-    let info = app.download_models[app.download_index].clone();
-
-    if model::cache_dir().join(info.file).is_file() {
-        app.set_model(
-            info.label.to_string(),
-            model::cache_dir()
-                .join(info.file)
-                .to_string_lossy()
-                .to_string(),
-        );
-        app.overlay = Overlay::None;
+    let Some(info) = app.download_models.get(app.download_index).cloned() else {
+        return;
+    };
+    let cached = model::cache_dir().join(info.file);
+    if cached.is_file() {
+        if let Err(e) = model::verify_model(&info, &cached) {
+            app.set_message(format!(
+                "{} is corrupted: {e}. remove and re-download it",
+                info.label
+            ));
+        } else {
+            app.set_model(info.label.to_string(), cached.to_string_lossy().to_string());
+            app.overlay = Overlay::None;
+        }
         return;
     }
     // a finished thread still holding its slot must be reaped before a new
@@ -886,7 +889,12 @@ fn start_download(
         *download_rx = None;
     }
     if downloader.is_some() {
-        app.set_message("download in progress (press c or esc to pause)");
+        let what = if app.download_paused {
+            "previous download is still stopping; press enter again in a moment"
+        } else {
+            "download in progress (press c or esc to pause)"
+        };
+        app.set_message(what);
         return;
     }
     app.download_paused = false;
@@ -947,6 +955,13 @@ fn do_export(app: &mut App) {
     } else {
         Some(std::path::Path::new(&app.out_dir))
     };
+    if let Some(dir) = out_dir
+        && let Err(e) = std::fs::create_dir_all(dir)
+    {
+        app.set_message(format!("cannot create {}: {e}", dir.display()));
+        app.overlay = Overlay::Message;
+        return;
+    }
     let path = util::output_path(&app.input, out_dir, fmt.extension());
     if path.exists() {
         app.set_message(format!(
