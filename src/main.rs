@@ -6,6 +6,7 @@ mod anim;
 mod app;
 mod cli;
 mod config;
+mod doctor;
 mod export;
 mod fetch;
 mod model;
@@ -24,7 +25,7 @@ use ratatui::backend::CrosstermBackend;
 use std::io::{self, Write};
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
-use worker::Event as WorkerEvent;
+use worker::{Event as WorkerEvent, EventKind as WorkerEventKind};
 
 struct TerminalGuard {
     active: bool,
@@ -34,23 +35,25 @@ impl TerminalGuard {
     fn enter() -> io::Result<Self> {
         terminal::enable_raw_mode()?;
         let mut out = io::stdout();
-        execute!(
+        // if any step here fails, the ones before it still need undoing. raw
+        // mode left behind on a failed start is a nasty thing to debug from a
+        // shell where every newline forgets to return the cursor.
+        if let Err(e) = execute!(
             out,
             EnterAlternateScreen,
             crossterm::event::EnableBracketedPaste
-        )?;
+        ) {
+            let _ = execute!(out, LeaveAlternateScreen);
+            let _ = terminal::disable_raw_mode();
+            return Err(e);
+        }
         Ok(Self { active: true })
     }
 
     fn restore(&mut self) {
         if self.active {
-            let mut out = io::stdout();
-            let _ = execute!(
-                out,
-                crossterm::event::DisableBracketedPaste,
-                LeaveAlternateScreen
-            );
-            let _ = terminal::disable_raw_mode();
+            let mut steps = terminal_cleanup();
+            let _ = restore_terminal_steps(&mut steps);
             self.active = false;
         }
     }
@@ -60,6 +63,40 @@ impl Drop for TerminalGuard {
     fn drop(&mut self) {
         self.restore();
     }
+}
+
+type CleanupStep = (&'static str, Box<dyn FnMut() -> io::Result<()>>);
+
+/// run each terminal cleanup independently. a failure in one must never skip
+/// the rest, and the caller gets to see which ones failed.
+fn restore_terminal_steps(steps: &mut [CleanupStep]) -> Vec<String> {
+    let mut failed = Vec::new();
+    for (name, step) in steps.iter_mut() {
+        if step().is_err() {
+            failed.push((*name).to_string());
+        }
+    }
+    failed
+}
+
+fn terminal_cleanup() -> Vec<CleanupStep> {
+    vec![
+        (
+            "bracketed paste",
+            Box::new(|| {
+                let mut out = io::stdout();
+                execute!(out, crossterm::event::DisableBracketedPaste)
+            }),
+        ),
+        (
+            "alternate screen",
+            Box::new(|| {
+                let mut out = io::stdout();
+                execute!(out, LeaveAlternateScreen)
+            }),
+        ),
+        ("raw mode", Box::new(terminal::disable_raw_mode)),
+    ]
 }
 
 fn cli_palette(args: &cli::Args) -> theme::Palette {
@@ -126,6 +163,13 @@ fn main() {
         println!("scribe {}", env!("CARGO_PKG_VERSION"));
         return;
     }
+    if args.doctor {
+        let code = doctor::run(args.model.as_ref().and_then(|p| p.to_str()));
+        if code != 0 {
+            std::process::exit(code);
+        }
+        return;
+    }
 
     if args.no_tui {
         match run_plain(&args) {
@@ -149,11 +193,8 @@ fn install_panic_hook() {
     let original = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let mut out = io::stdout();
-        let _ = execute!(
-            out,
-            crossterm::event::DisableBracketedPaste,
-            LeaveAlternateScreen
-        );
+        let _ = execute!(out, crossterm::event::DisableBracketedPaste);
+        let _ = execute!(out, LeaveAlternateScreen);
         let _ = terminal::disable_raw_mode();
         original(info);
     }));
@@ -178,29 +219,30 @@ fn run_plain(args: &Args) -> Result<String, String> {
         translate: args.translate.unwrap_or(false),
     };
     let (tx, rx) = mpsc::channel();
-    let handle = worker::spawn(job, tx);
+    let handle = worker::spawn(job, tx, worker::next_job_id());
     let mut segments = Vec::new();
+    let mut failure = None;
     for event in rx {
-        match event {
-            WorkerEvent::Segment(s) => segments.push(s),
-            WorkerEvent::Error(e) => return Err(e),
+        match event.kind {
+            WorkerEventKind::Segment(s) => segments.push(s),
+            WorkerEventKind::Error(e) => {
+                failure = Some(e);
+                break;
+            }
             _ => {}
         }
     }
-    drop(handle);
+    // the worker may still be unwinding after its last event. stop joins it.
+    handle.stop();
+    if let Some(e) = failure {
+        return Err(e);
+    }
     let output = export::export(args.format, &segments, Some(source));
     if let Some(dir) = &args.out {
         std::fs::create_dir_all(dir)
             .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
         let path = util::output_path(source, Some(dir), args.format.extension());
-        if path.exists() {
-            return Err(format!(
-                "{} already exists; refusing to overwrite it",
-                path.display()
-            ));
-        }
-        std::fs::write(&path, output)
-            .map_err(|e| format!("could not write {}: {e}", path.display()))?;
+        export::write_exclusive(&path, output.as_bytes())?;
         Ok(String::new())
     } else {
         Ok(output)
@@ -235,6 +277,9 @@ fn run_tui(args: &Args) -> Result<(), String> {
 
     let (tx, rx): (mpsc::Sender<WorkerEvent>, mpsc::Receiver<WorkerEvent>) = mpsc::channel();
     let mut handle: Option<worker::Handle> = None;
+    // cancelled workers keep running until they notice the flag. park their
+    // handles here and reap them in the loop instead of freezing the ui.
+    let mut retiring: Vec<worker::Handle> = Vec::new();
     let mut downloader: Option<std::thread::JoinHandle<()>> = None;
     let mut download_rx: Option<Receiver<model::DownloadProgress>> = None;
     let mut download_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>> = None;
@@ -328,27 +373,29 @@ fn run_tui(args: &Args) -> Result<(), String> {
         }
 
         while let Ok(ev) = rx.try_recv() {
+            // stragglers from a cancelled or replaced job have no business
+            // touching the current transcript. their handle is already joined.
+            if ev.job_id != app.job_id {
+                continue;
+            }
+            let terminal = matches!(
+                ev.kind,
+                WorkerEventKind::Done | WorkerEventKind::Cancelled | WorkerEventKind::Error(_)
+            );
             needs_redraw = true;
-            match ev {
-                WorkerEvent::Stage(s) => app.on_stage(s),
-                WorkerEvent::Info { title, duration } => app.on_info(title, duration),
-                WorkerEvent::Progress { done_s } => app.on_progress(done_s),
-                WorkerEvent::Envelope(e) => app.on_envelope(e),
-                WorkerEvent::Segment(s) => app.on_segment(s),
-                WorkerEvent::Done => {
-                    app.on_done();
-                    handle = None;
-                }
-                WorkerEvent::Cancelled => {
-                    app.on_cancelled();
-                    handle = None;
-                }
-                WorkerEvent::Error(e) => {
-                    app.on_error(e);
-                    handle = None;
-                }
+            app.accept_event(ev);
+            if terminal && let Some(mut h) = handle.take() {
+                h.join_finished();
             }
         }
+        let mut still_running = Vec::new();
+        for mut h in retiring.drain(..) {
+            h.join_finished();
+            if !h.thread_finished() {
+                still_running.push(h);
+            }
+        }
+        retiring = still_running;
 
         if event::poll(Duration::from_millis(30)).unwrap_or(false)
             && let Ok(ev) = event::read()
@@ -364,6 +411,7 @@ fn run_tui(args: &Args) -> Result<(), String> {
                         &mut app,
                         &tx,
                         &mut handle,
+                        &mut retiring,
                         &mut downloader,
                         &mut download_rx,
                         &mut download_cancel,
@@ -396,10 +444,11 @@ fn run_tui(args: &Args) -> Result<(), String> {
             .is_ok_and(|size| size.width >= 70 && size.height >= 14)
             && app.overlay == Overlay::None;
         let cat_visible = app.segments.is_empty() && app.overlay == Overlay::None;
+        // a static overlay needs one redraw on open, not thirty per second.
+        // key events already set needs_redraw, so it can sit idle afterwards.
         let animating = meter_visible
             || cat_visible
             || app.status.active()
-            || app.overlay != Overlay::None
             || app.scroll_home
             || (app.progress - app.progress_smooth as f64).abs() > 0.001
             || (app.scroll as f32 - app.scroll_smooth).abs() > 0.5;
@@ -425,17 +474,36 @@ fn run_tui(args: &Args) -> Result<(), String> {
         }
     }
 
-    if let Some(h) = handle.take() {
-        h.cancel();
-    }
     if let Some(cancel) = download_cancel.take() {
         cancel.store(true, std::sync::atomic::Ordering::Relaxed);
     }
     if let Some(h) = downloader.take() {
         let _ = h.join();
     }
+    // restore the terminal before waiting on a possibly slow worker window.
     guard.restore();
+    if let Some(h) = handle.take() {
+        h.stop();
+    }
+    for h in retiring {
+        h.stop();
+    }
     Ok(())
+}
+
+/// invalidate the current job and park its handle for reaping. the worker's
+/// final event will arrive carrying the old id and be dropped by the loop.
+fn retire(handle: &mut Option<worker::Handle>, retiring: &mut Vec<worker::Handle>, app: &mut App) {
+    if let Some(h) = handle.take() {
+        h.cancel();
+        // the next id must differ from the one we just retired, even if the
+        // counter wrapped around at some point.
+        app.job_id = worker::next_job_id().max(h.job_id() + 1);
+        retiring.push(h);
+    } else {
+        app.job_id = worker::next_job_id();
+    }
+    app.pending_resume = false;
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -444,6 +512,7 @@ fn process_key(
     app: &mut App,
     tx: &mpsc::Sender<WorkerEvent>,
     handle: &mut Option<worker::Handle>,
+    retiring: &mut Vec<worker::Handle>,
     downloader: &mut Option<std::thread::JoinHandle<()>>,
     download_rx: &mut Option<Receiver<model::DownloadProgress>>,
     download_cancel: &mut Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
@@ -452,9 +521,7 @@ fn process_key(
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         match key.code {
             KeyCode::Char('c') | KeyCode::Char('C') | KeyCode::Char('q') => {
-                if let Some(h) = handle.take() {
-                    h.cancel();
-                }
+                retire(handle, retiring, app);
                 app.status = Status::Cancelled;
                 app.quit = true;
                 return;
@@ -642,9 +709,7 @@ fn process_key(
                 }
                 app.pause();
             } else if app.status == Status::Paused {
-                if let Some(h) = handle.take() {
-                    h.cancel();
-                }
+                retire(handle, retiring, app);
                 app.on_cancelled();
             } else if !app.query.is_empty() {
                 app.query.clear();
@@ -687,9 +752,7 @@ fn process_key(
         KeyCode::Char('c')
             if app.status.active() || app.pending_resume || app.status == Status::Paused =>
         {
-            if let Some(h) = handle.take() {
-                h.cancel();
-            }
+            retire(handle, retiring, app);
             app.on_cancelled();
         }
         KeyCode::Up if app.focus == Focus::Input && !app.completion.candidates.is_empty() => {
@@ -729,10 +792,15 @@ fn process_key(
             if app.focus == Focus::Input {
                 app.accept_completion();
                 if app.can_start() {
-                    app.start();
+                    // if a stale handle survived a missed terminal event, stop
+                    // it before handing the channel to a new worker.
+                    if let Some(old) = handle.take() {
+                        old.stop();
+                    }
+                    let job_id = worker::next_job_id();
+                    app.start(job_id);
                     let job = build_job(app);
-                    let handle_new = worker::spawn(job, tx.clone());
-                    *handle = Some(handle_new);
+                    *handle = Some(worker::spawn(job, tx.clone(), job_id));
                 }
             } else if !app.segments.is_empty() {
                 app.overlay = Overlay::Export;
@@ -803,11 +871,17 @@ fn change_setting(app: &mut App, forward: bool) {
     match app.settings_index {
         0 => app.threads = (app.threads + if forward { 1 } else { -1 }).clamp(1, 32),
         1 => {
-            let langs = ["auto", "en", "fr", "de", "es", "it", "pt", "ja", "zh", "ko"];
-            let pos = langs.iter().position(|l| *l == app.lang).unwrap_or(0);
+            let langs = util::LANGUAGES;
+            let pos = langs
+                .iter()
+                .position(|(code, _)| *code == app.lang)
+                .unwrap_or(0);
             let next = (pos as isize + if forward { 1 } else { -1 })
                 .rem_euclid(langs.len() as isize) as usize;
-            app.lang = langs[next].to_string();
+            app.lang = langs[next].0.to_string();
+            if let Some(name) = util::language_name(&app.lang) {
+                app.set_message(format!("language: {name} ({})", app.lang));
+            }
         }
         2 => app.translate = !app.translate,
         3 => {
@@ -866,7 +940,7 @@ fn start_download(
     };
     let cached = model::cache_dir().join(info.file);
     if cached.is_file() {
-        if let Err(e) = model::verify_model(&info, &cached) {
+        if let Err(e) = model::validate_cached(&info, &cached) {
             app.set_message(format!(
                 "{} is corrupted: {e}. remove and re-download it",
                 info.label
@@ -963,22 +1037,14 @@ fn do_export(app: &mut App) {
         return;
     }
     let path = util::output_path(&app.input, out_dir, fmt.extension());
-    if path.exists() {
-        app.set_message(format!(
-            "{} already exists. move it or pick a different output dir",
-            path.display()
-        ));
-        app.overlay = Overlay::Message;
-        return;
-    }
     let text = export::export(fmt, &app.segments, Some(&app.input));
-    match std::fs::write(&path, text) {
+    match export::write_exclusive(&path, text.as_bytes()) {
         Ok(()) => {
             app.set_message(format!("saved to {}", path.display()));
             app.overlay = Overlay::None;
         }
         Err(e) => {
-            app.set_message(format!("could not write {}: {e}", path.display()));
+            app.set_message(e);
             app.overlay = Overlay::Message;
         }
     }
@@ -995,3 +1061,33 @@ fn copy_selection(app: &mut App) {
 }
 
 use util::{duration_short, human_bytes, timestamp_short};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn terminal_cleanup_continues_after_a_failed_step() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        let ran = Rc::new(RefCell::new(Vec::new()));
+        let mut steps: Vec<CleanupStep> = Vec::new();
+        for (name, fails) in [("first", true), ("second", false), ("third", false)] {
+            let ran = ran.clone();
+            steps.push((
+                name,
+                Box::new(move || {
+                    ran.borrow_mut().push(name);
+                    if fails {
+                        Err(io::Error::other("nope"))
+                    } else {
+                        Ok(())
+                    }
+                }),
+            ));
+        }
+        let failed = restore_terminal_steps(&mut steps);
+        assert_eq!(failed, vec!["first".to_string()]);
+        assert_eq!(*ran.borrow(), vec!["first", "second", "third"]);
+    }
+}

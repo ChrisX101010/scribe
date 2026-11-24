@@ -10,8 +10,10 @@ use crate::cli::Args;
 use crate::export::{Format, Segment};
 use crate::model::{self, ModelInfo};
 use crate::theme::ThemeKind;
-use crate::util::{CompletionCandidate, common_prefix, duration_short, is_url};
-use crate::worker::Stage;
+use crate::util::{
+    CompletionCandidate, common_prefix, duration_short, is_url, sanitize_terminal, wrap,
+};
+use crate::worker::{Event as WorkerEvent, EventKind as WorkerEventKind, Stage};
 use std::time::Instant;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -98,6 +100,9 @@ pub enum ToastKind {
     Warn,
     Error,
 }
+
+type VisualLines = Vec<(usize, String, usize)>;
+type VisualCache = Option<(usize, usize, VisualLines, usize)>;
 
 /// a small, non-blocking notice that lives in the bottom-right corner and
 /// fades out on its own. used for download and pause events so the transcript
@@ -199,6 +204,14 @@ pub struct App {
     /// matters because process::exit() skips destructors and leaves the
     /// terminal in raw mode. ask me how i learned that.
     pub quit: bool,
+    /// identity of the job whose events this app will accept. incremented when
+    /// a new job starts, so stragglers from the previous one are ignored.
+    pub job_id: u64,
+    /// wrapped transcript lines, rebuilt only when segments or width change.
+    /// wrapping a 90-minute transcript on every frame was the hot path.
+    visual_cache: VisualCache,
+    /// bumped whenever the transcript itself changes.
+    segments_version: usize,
 }
 
 impl App {
@@ -274,6 +287,9 @@ impl App {
             tick: 0,
             animation_time: 0.0,
             quit: false,
+            job_id: 0,
+            visual_cache: None,
+            segments_version: 0,
         };
         let suggested = model::default_model().label;
         app.set_message(format!(
@@ -309,6 +325,50 @@ impl App {
             "tools will fetch themselves on first url"
         };
         self.set_message(format!("model: {} · {tools}", self.model_label));
+    }
+
+    /// apply a worker event if and only if it belongs to the current job.
+    /// returns whether the event was accepted.
+    pub fn accept_event(&mut self, event: WorkerEvent) -> bool {
+        if event.job_id != self.job_id {
+            return false;
+        }
+        match event.kind {
+            WorkerEventKind::Stage(s) => self.on_stage(s),
+            WorkerEventKind::Info { title, duration } => self.on_info(title, duration),
+            WorkerEventKind::Progress { done_s } => self.on_progress(done_s),
+            WorkerEventKind::Envelope(e) => self.on_envelope(e),
+            WorkerEventKind::Segment(s) => self.on_segment(s),
+            WorkerEventKind::Done => self.on_done(),
+            WorkerEventKind::Cancelled => self.on_cancelled(),
+            WorkerEventKind::Error(e) => self.on_error(e),
+        }
+        true
+    }
+
+    /// visual lines for the given text width, plus the selected line. cached
+    /// so idle frames and cursor moves do not re-wrap the whole transcript.
+    pub fn visual_lines(&mut self, text_w: usize) -> (VisualLines, usize) {
+        let version = self.segments_version;
+        if let Some((cached_version, cached_w, lines, selected)) = &self.visual_cache
+            && *cached_version == version
+            && *cached_w == text_w
+        {
+            return (lines.clone(), *selected);
+        }
+        let mut lines = Vec::new();
+        let mut selected_line = 0usize;
+        for (idx, seg) in self.segments.iter().enumerate() {
+            let wrapped = wrap(&sanitize_terminal(&seg.text), text_w);
+            if idx == self.selected {
+                selected_line = lines.len();
+            }
+            for (li, line) in wrapped.into_iter().enumerate() {
+                lines.push((idx, line, li));
+            }
+        }
+        self.visual_cache = Some((version, text_w, lines.clone(), selected_line));
+        (lines, selected_line)
     }
 
     pub fn on_stage(&mut self, stage: Stage) {
@@ -357,11 +417,18 @@ impl App {
         if self.status == Status::Paused {
             return;
         }
+        let matches_query =
+            !self.query.is_empty() && seg.text.to_lowercase().contains(&self.query.to_lowercase());
         self.segments.push(seg);
+        self.segments_version = self.segments_version.wrapping_add(1);
         if self.follow {
             self.selected = self.segments.len() - 1;
         }
-        self.recompute_search();
+        // appending a segment cannot invalidate earlier matches. keep the
+        // query's hits and test only the new line instead of rescanning all.
+        if matches_query {
+            self.matches.push(self.segments.len() - 1);
+        }
     }
 
     pub fn on_done(&mut self) {
@@ -470,6 +537,10 @@ impl App {
     }
 
     pub fn can_start(&mut self) -> bool {
+        if self.status.active() || self.pending_resume || self.status == Status::Paused {
+            self.set_message("a job is already live. pause with space, or stop it with c first");
+            return false;
+        }
         if self.input.trim().is_empty() {
             self.set_message("feed me a file path or a url first");
             return false;
@@ -491,8 +562,12 @@ impl App {
         true
     }
 
-    pub fn start(&mut self) {
+    pub fn start(&mut self, job_id: u64) {
+        self.job_id = job_id;
+        self.title.clear();
+        self.source_duration = None;
         self.segments.clear();
+        self.segments_version = self.segments_version.wrapping_add(1);
         self.selected = 0;
         self.scroll = 0;
         self.scroll_smooth = 0.0;
@@ -528,7 +603,7 @@ impl App {
         self.paused_at = Some(Instant::now());
         self.stage_started = Instant::now();
         self.set_message(format!(
-            "paused at {} · space or enter to resume",
+            "paused at {} · inference parked (a fetching/decoding step may still finish) · space or enter to resume",
             duration_short(self.done_seconds)
         ));
         self.toast(
@@ -602,9 +677,9 @@ impl App {
             self.match_idx = 0;
             return;
         }
-        let needle = self.query.to_ascii_lowercase();
+        let needle = self.query.to_lowercase();
         for (i, seg) in self.segments.iter().enumerate() {
-            if seg.text.to_ascii_lowercase().contains(&needle) {
+            if seg.text.to_lowercase().contains(&needle) {
                 self.matches.push(i);
             }
         }
@@ -988,7 +1063,8 @@ mod tests {
         app.recompute_search();
         app.finished_at = Some(Instant::now());
 
-        app.start();
+        app.start(42);
+        assert_eq!(app.job_id, 42);
         assert!(app.segments.is_empty());
         assert_eq!(app.done_seconds, 0.0);
         assert_eq!(app.progress, 0.0);
@@ -1011,6 +1087,65 @@ mod tests {
         assert!(app.paused_at.is_none());
         assert_eq!(app.status, Status::Cancelled);
         assert!(app.elapsed_s() <= 5.5, "paused time should be excluded");
+    }
+
+    #[test]
+    fn stale_job_events_are_rejected() {
+        let mut app = App::new(&Args::default());
+        app.start(10);
+        let stale = WorkerEvent {
+            job_id: 9,
+            kind: WorkerEventKind::Segment(Segment::new(0, 100, "old".into())),
+        };
+        assert!(!app.accept_event(stale));
+        assert!(app.segments.is_empty());
+        let fresh = WorkerEvent {
+            job_id: 10,
+            kind: WorkerEventKind::Segment(Segment::new(0, 100, "new".into())),
+        };
+        assert!(app.accept_event(fresh));
+        assert_eq!(app.segments.len(), 1);
+    }
+
+    #[test]
+    fn stale_done_cannot_finish_a_new_job() {
+        let mut app = App::new(&Args::default());
+        app.start(11);
+        let old_done = WorkerEvent {
+            job_id: 10,
+            kind: WorkerEventKind::Done,
+        };
+        assert!(!app.accept_event(old_done));
+        assert_eq!(app.status, Status::Fetching);
+        let done = WorkerEvent {
+            job_id: 11,
+            kind: WorkerEventKind::Done,
+        };
+        assert!(app.accept_event(done));
+        assert_eq!(app.status, Status::Ready);
+    }
+
+    #[test]
+    fn active_job_blocks_a_second_start() {
+        let mut app = App::new(&Args::default());
+        app.input = "https://example.com/a".into();
+        app.start(12);
+        assert!(!app.can_start());
+        assert_eq!(app.job_id, 12);
+    }
+
+    #[test]
+    fn incremental_search_matches_full_rescan() {
+        let mut app = App::new(&Args::default());
+        app.status = Status::Transcribing;
+        app.query = "hello".into();
+        app.on_segment(Segment::new(0, 100, "hello one".into()));
+        app.on_segment(Segment::new(100, 200, "nothing".into()));
+        app.on_segment(Segment::new(200, 300, "HELLO two".into()));
+        let incremental = app.matches.clone();
+        app.recompute_search();
+        assert_eq!(incremental, app.matches);
+        assert_eq!(app.matches, vec![0, 2]);
     }
 
     #[test]

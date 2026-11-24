@@ -41,6 +41,32 @@ jobs:
       - run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - run: cargo test --locked --all-targets --all-features
 
+      - name: cli smoke
+        run: |
+          cargo run --locked --quiet -- --version
+          cargo run --locked --quiet -- --doctor || test $? -eq 1
+          cargo run --locked --quiet -- --help >/dev/null
+
+  msrv:
+    name: msrv (1.90)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.90.0"
+
+      - uses: Swatinem/rust-cache@v2
+
+      - run: |
+          sudo apt-get update
+          sudo apt-get install -y clang libclang-dev cmake pkg-config
+
+      - run: cargo check --locked --all-targets
+
   release:
     name: release (${{ matrix.target }})
     needs: check
@@ -91,6 +117,17 @@ jobs:
           mkdir -p dist
           cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" "dist/${{ matrix.asset }}"
           test -s "dist/${{ matrix.asset }}"
+          "target/${{ matrix.target }}/release/${{ matrix.binary }}" --version
+
+      - name: checksums
+        shell: bash
+        run: |
+          cd dist
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "${{ matrix.asset }}" > SHA256SUMS
+          else
+            shasum -a 256 "${{ matrix.asset }}" > SHA256SUMS
+          fi
 
       # each target uploads its own binary. no generated notes, no body edits:
       # three matrix jobs appending notes gave us three changelog links.

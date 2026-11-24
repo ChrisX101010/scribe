@@ -268,6 +268,38 @@ pub fn export(format: Format, segments: &[Segment], source: Option<&str>) -> Str
     }
 }
 
+/// Write an export without ever touching an existing file. `create_new` is the
+/// whole trick: an `exists()` check before `write()` is a race, and losing it
+/// means somebody's transcript gets quietly replaced. a failed write removes
+/// its own output so a half-written export never lingers.
+pub fn write_exclusive(path: &std::path::Path, data: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                format!(
+                    "{} already exists; refusing to overwrite it",
+                    path.display()
+                )
+            } else {
+                format!("cannot create {}: {e}", path.display())
+            }
+        })?;
+    if let Err(e) = file
+        .write_all(data)
+        .and_then(|()| file.flush())
+        .and_then(|()| file.sync_all())
+    {
+        drop(file);
+        let _ = std::fs::remove_file(path);
+        return Err(format!("could not write {}: {e}", path.display()));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -400,5 +432,35 @@ mod tests {
     fn long_recording_timestamps_have_hours() {
         let s = to_srt(&[Segment::new(3_661_234, 3_661_334, "late".into())]);
         assert!(s.contains("10:10:12,340 --> 10:10:13,340"));
+    }
+
+    #[test]
+    fn exclusive_write_refuses_to_replace_an_existing_export() {
+        let dir = std::env::temp_dir().join(format!(
+            "scribe-export-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("unicode 名.txt");
+        std::fs::write(&path, b"keep me").unwrap();
+        let err = write_exclusive(&path, b"new").unwrap_err();
+        assert!(err.contains("refusing to overwrite"), "{err}");
+        assert_eq!(std::fs::read(&path).unwrap(), b"keep me");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn exclusive_write_handles_spaces_and_unicode_paths() {
+        let dir =
+            std::env::temp_dir().join(format!("scribe-export-unicode-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("meeting 会议.srt");
+        write_exclusive(&path, b"hello").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"hello");
+        assert!(write_exclusive(&path, b"again").is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

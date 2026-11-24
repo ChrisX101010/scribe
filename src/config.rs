@@ -18,12 +18,7 @@ pub struct Preferences {
 }
 
 pub fn path() -> PathBuf {
-    let dir = if let Some(root) = std::env::var_os("XDG_CONFIG_HOME").filter(|p| !p.is_empty()) {
-        PathBuf::from(root)
-    } else {
-        PathBuf::from(std::env::var_os("HOME").unwrap_or_else(|| ".".into())).join(".config")
-    };
-    dir.join("scribe").join("config")
+    crate::util::config_home().join("scribe").join("config")
 }
 
 fn unescape(value: &str) -> String {
@@ -212,7 +207,9 @@ pub fn apply(args: &mut Args) {
         args.threads = prefs.threads;
     }
     if args.lang.is_none() {
-        args.lang = prefs.lang;
+        args.lang = prefs
+            .lang
+            .filter(|l| crate::util::validate_language(l).is_ok());
     }
     if args.translate.is_none() {
         args.translate = prefs.translate;

@@ -2,9 +2,9 @@
 # the crates.io name "scribe" was taken years ago. the command is still
 # `scribe`; only the package name had to get creative.
 name = "scribe-tui"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.90"
 description = "local, offline, cpu-only speech to text in the terminal"
 license = "MIT"
 readme = "readme.md"
@@ -42,9 +42,9 @@ unicode-width = "0.2.3"
 # worker thread, so the tui event loop remains synchronous.
 yt-dlp = { version = "2.10.0", default-features = false, features = ["cache-json", "rustls"] }
 # minimal tokio for the current-thread runtime used by the yt-dlp wrapper.
-tokio = { version = "1", features = ["rt", "fs", "process", "time", "sync"] }
+tokio = { version = "1.54.1", features = ["rt", "fs", "process", "time", "sync"] }
 # sha256 verification of downloaded model files against the upstream table.
-sha2 = "0.10"
+sha2 = "0.11.1"
 # locate ffprobe on path; used by the duration detector in worker.rs.
 which = "8"
 

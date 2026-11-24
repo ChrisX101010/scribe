@@ -18,6 +18,7 @@ pub struct Args {
     pub theme: Option<String>,
     pub help: bool,
     pub version: bool,
+    pub doctor: bool,
 }
 
 impl Default for Args {
@@ -35,6 +36,7 @@ impl Default for Args {
             theme: None,
             help: false,
             version: false,
+            doctor: false,
         }
     }
 }
@@ -90,6 +92,10 @@ pub const HELP_SECTIONS: &[HelpSection] = &[
             HelpLine {
                 key: "--no-tui",
                 desc: "transcript to stdout, for scripts",
+            },
+            HelpLine {
+                key: "--doctor",
+                desc: "read-only installation and readiness check",
             },
             HelpLine {
                 key: "--version",
@@ -301,6 +307,7 @@ pub fn parse(argv: &[String]) -> Result<Args, String> {
             "--help" | "-h" => out.help = true,
             "--version" | "-V" => out.version = true,
             "--no-tui" => out.no_tui = true,
+            "--doctor" => out.doctor = true,
             "--translate" => out.translate = Some(true),
             "--model" | "-m" => {
                 let value = need_value(argv, &mut i, arg)?;
@@ -324,6 +331,7 @@ pub fn parse(argv: &[String]) -> Result<Args, String> {
                 if value.starts_with('-') {
                     return Err(format!("{arg} is missing its value"));
                 }
+                crate::util::validate_language(&value).map_err(|e| format!("--lang: {e}"))?;
                 out.lang = Some(value);
             }
             "--out" | "-o" => {
@@ -447,6 +455,18 @@ mod tests {
         assert!(args.format_explicit);
         assert_eq!(args.theme.as_deref(), Some("nord"));
         assert!(args.no_tui);
+    }
+
+    #[test]
+    fn doctor_flag_parses() {
+        assert!(a(&["--doctor"]).unwrap().doctor);
+        assert!(!a(&[]).unwrap().doctor);
+    }
+
+    #[test]
+    fn invalid_language_is_rejected() {
+        assert!(a(&["--lang", "xx-not-real"]).is_err());
+        assert!(a(&["--lang", "auto"]).is_ok());
     }
 
     #[test]

@@ -20,24 +20,10 @@ pub struct FetchedAudio {
 /// where the managed binaries live. versioned directory so a future yt-dlp
 /// upgrade cannot trip over yesterday's binary and make a mess of things.
 pub fn libs_dir() -> PathBuf {
-    let base = if let Ok(xdg) = std::env::var("XDG_CACHE_HOME") {
-        if !xdg.is_empty() {
-            PathBuf::from(xdg).join("scribe")
-        } else {
-            default_home()
-        }
-    } else {
-        default_home()
-    };
-    base.join("bin").join("yt-dlp-2")
-}
-
-fn default_home() -> PathBuf {
-    std::env::var("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("."))
-        .join(".cache")
+    crate::util::cache_home()
         .join("scribe")
+        .join("bin")
+        .join("yt-dlp-2")
 }
 
 fn output_dir() -> PathBuf {

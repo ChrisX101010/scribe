@@ -10,7 +10,7 @@ use crate::util::is_url;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, ChildStdout, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -20,7 +20,8 @@ use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextPar
 pub const SAMPLE_RATE: usize = 16_000;
 const WINDOW: usize = 30 * SAMPLE_RATE;
 const CHUNK: usize = SAMPLE_RATE;
-const MIN_TAIL: usize = SAMPLE_RATE / 2;
+/// whisper expects a 30 s window. short clips get zero padded instead of being
+/// thrown away: 0.4 s of speech is still a transcript, just a short one.
 const MIN_WINDOW: usize = SAMPLE_RATE + SAMPLE_RATE / 10;
 const EDGE_CS: i64 = 150;
 pub const ENVELOPE_BUCKETS: usize = 64;
@@ -41,8 +42,17 @@ pub enum Stage {
     Transcribing,
 }
 
+/// every event carries the id of the job that produced it. the ui drops
+/// anything from an older job, so a cancelled worker cannot scribble its last
+/// segments or its "done" into the next transcript.
 #[derive(Debug)]
-pub enum Event {
+pub struct Event {
+    pub job_id: u64,
+    pub kind: EventKind,
+}
+
+#[derive(Debug)]
+pub enum EventKind {
     Stage(Stage),
     Info {
         title: String,
@@ -58,15 +68,27 @@ pub enum Event {
     Error(String),
 }
 
+impl Event {
+    fn new(job_id: u64, kind: EventKind) -> Self {
+        Self { job_id, kind }
+    }
+}
+
 type Children = Arc<Mutex<Vec<Child>>>;
 
 pub struct Handle {
+    job_id: u64,
     cancel: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
     children: Children,
+    thread: Option<thread::JoinHandle<()>>,
 }
 
 impl Handle {
+    pub fn job_id(&self) -> u64 {
+        self.job_id
+    }
+
     pub fn cancel(&self) {
         self.cancel.store(true, Ordering::Relaxed);
         kill_all(&self.children);
@@ -81,34 +103,79 @@ impl Handle {
     pub fn resume(&self) {
         self.paused.store(false, Ordering::Release);
     }
+
+    /// ask the worker to stop and wait for it. called when a handle is retired,
+    /// so no thread outlives the job it belongs to.
+    pub fn stop(mut self) {
+        self.cancel();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+
+    /// drop the terminal event of a finished worker without blocking. only use
+    /// when the worker is known to have sent its final event already.
+    pub fn join_finished(&mut self) {
+        if self.thread_finished()
+            && let Some(thread) = self.thread.take()
+        {
+            let _ = thread.join();
+        }
+    }
+
+    pub fn thread_finished(&self) -> bool {
+        self.thread
+            .as_ref()
+            .is_none_or(|thread| thread.is_finished())
+    }
 }
 
 impl Drop for Handle {
     fn drop(&mut self) {
         self.cancel();
+        // joining here keeps cancellation deterministic: no detached worker
+        // can still be churning through a window while the next job starts.
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
     }
 }
 
-pub fn spawn(job: Job, tx: Sender<Event>) -> Handle {
+static NEXT_JOB_ID: AtomicU64 = AtomicU64::new(1);
+
+pub fn next_job_id() -> u64 {
+    NEXT_JOB_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+pub fn spawn(job: Job, tx: Sender<Event>, job_id: u64) -> Handle {
     let cancel = Arc::new(AtomicBool::new(false));
     let paused = Arc::new(AtomicBool::new(false));
     let children: Children = Arc::new(Mutex::new(Vec::new()));
-    {
+    let thread = {
         let (cancel, paused, children) = (cancel.clone(), paused.clone(), children.clone());
         let thread_tx = tx.clone();
-        if let Err(e) = thread::Builder::new()
+        match thread::Builder::new()
             .name("scribe-worker".into())
-            .spawn(move || run(&job, &thread_tx, &cancel, &paused, &children))
+            .spawn(move || run(&job, job_id, &thread_tx, &cancel, &paused, &children))
         {
-            // without this the ui would sit there waiting for an event that
-            // never arrives. tell it what happened instead.
-            let _ = tx.send(Event::Error(format!("cannot start worker thread: {e}")));
+            Ok(thread) => Some(thread),
+            Err(e) => {
+                // without this the ui would sit there waiting for an event that
+                // never arrives. tell it what happened instead.
+                let _ = tx.send(Event::new(
+                    job_id,
+                    EventKind::Error(format!("cannot start worker thread: {e}")),
+                ));
+                None
+            }
         }
-    }
+    };
     Handle {
+        job_id,
         cancel,
         paused,
         children,
+        thread,
     }
 }
 
@@ -142,42 +209,61 @@ fn reap(children: &Children) {
 
 fn run(
     job: &Job,
+    job_id: u64,
     tx: &Sender<Event>,
     cancel: &Arc<AtomicBool>,
     paused: &Arc<AtomicBool>,
     children: &Children,
 ) {
-    let result = pipeline(job, tx, cancel, paused, children);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        pipeline(job, job_id, tx, cancel, paused, children)
+    }));
     reap(children);
     let last = match result {
-        _ if cancel.load(Ordering::Relaxed) => Event::Cancelled,
-        Ok(()) => Event::Done,
-        Err(e) => Event::Error(e),
+        Err(_) => EventKind::Error("the worker panicked. the job was abandoned; try again".into()),
+        Ok(_) if cancel.load(Ordering::Relaxed) => EventKind::Cancelled,
+        Ok(Ok(())) => EventKind::Done,
+        Ok(Err(e)) => EventKind::Error(e),
     };
-    let _ = tx.send(last);
+    let _ = tx.send(Event::new(job_id, last));
 }
 
-/// system ffmpeg if there is one, otherwise the one the yt-dlp crate fetched.
-/// reusing the managed binary for local files means one less thing to install.
-pub fn ffmpeg_command() -> Command {
-    Command::new(crate::fetch::ffmpeg_path().unwrap_or_else(|| PathBuf::from("ffmpeg")))
+/// one source of truth for the decoder binary. checking one path and spawning
+/// another is how you end up debugging a failure from a binary you never tested.
+pub fn resolve_ffmpeg() -> Result<PathBuf, String> {
+    if let Ok(path) = which::which("ffmpeg") {
+        return Ok(path);
+    }
+    if let Some(path) = crate::fetch::ffmpeg_path() {
+        return Ok(path);
+    }
+    Err(
+        "ffmpeg is not installed and no managed copy is available. install ffmpeg, or use a url so scribe can fetch its managed copy".into(),
+    )
 }
 
-/// a friendly pre-flight check. ffmpeg is required for everything, so we look
-/// for it here. yt-dlp is fetched on demand by the url path, so asking about it
-/// this early would just produce a lie on first run.
-pub fn check_tools(_need_ytdlp: bool) -> Result<(), String> {
-    let ffmpeg = crate::fetch::ffmpeg_path().unwrap_or_else(|| PathBuf::from("ffmpeg"));
-    if Command::new(&ffmpeg)
+pub fn ffmpeg_command() -> Result<Command, String> {
+    Ok(Command::new(resolve_ffmpeg()?))
+}
+
+/// pre-flight for local files. url jobs install ffmpeg as part of fetching, so
+/// demanding it here would turn the first url transcription into a false alarm.
+pub fn check_tools(need_ytdlp: bool) -> Result<(), String> {
+    if need_ytdlp {
+        return Ok(());
+    }
+    let ffmpeg = resolve_ffmpeg()?;
+    let status = Command::new(&ffmpeg)
         .arg("-version")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
-        .is_err()
-    {
-        return Err(
-            "ffmpeg is missing and i could not fetch it. check your network, then try again".into(),
-        );
+        .map_err(|e| format!("cannot run {}: {e}", ffmpeg.display()))?;
+    if !status.success() {
+        return Err(format!(
+            "{} is present but failed its self check",
+            ffmpeg.display()
+        ));
     }
     Ok(())
 }
@@ -187,7 +273,7 @@ fn first_line(bytes: &[u8]) -> String {
         .lines()
         .map(str::trim)
         .find(|l| !l.is_empty())
-        .unwrap_or("ffmpeg reported no duration for this file")
+        .unwrap_or("ffmpeg gave no details")
         .to_string()
 }
 
@@ -224,7 +310,7 @@ fn local_info(path: &str) -> (String, Option<f64>) {
         .filter(|d| *d > 0.0)
         .or_else(|| {
             // fallback: check ffmpeg -i stderr for "Duration: 00:00:00.00"
-            let ffmpeg = crate::fetch::ffmpeg_path().unwrap_or_else(|| PathBuf::from("ffmpeg"));
+            let ffmpeg = resolve_ffmpeg().ok()?;
             let output = Command::new(&ffmpeg)
                 .args(["-i", path])
                 .stdin(Stdio::null())
@@ -259,11 +345,16 @@ enum Chunk {
     Failed(String),
 }
 
-fn start_decoder(
+fn start_decoder(source: &Path, children: &Children) -> Result<(ChildStdout, ChildStderr), String> {
+    let command = ffmpeg_command()?;
+    start_decoder_with(source, children, command)
+}
+
+fn start_decoder_with(
     source: &Path,
     children: &Children,
-) -> Result<(ChildStdout, Option<ChildStderr>), String> {
-    let mut ffmpeg = ffmpeg_command();
+    mut ffmpeg: Command,
+) -> Result<(ChildStdout, ChildStderr), String> {
     ffmpeg
         .args(["-v", "error", "-nostdin", "-i"])
         .arg(source)
@@ -279,7 +370,10 @@ fn start_decoder(
         .stdout
         .take()
         .ok_or("ffmpeg gave me no stdout to read")?;
-    let err = child.stderr.take();
+    let err = child
+        .stderr
+        .take()
+        .ok_or("ffmpeg gave me no stderr to drain")?;
     children
         .lock()
         .map_err(|_| "mutex poisoned; this should never happen")?
@@ -311,37 +405,131 @@ pub fn bytes_to_f32(bytes: &[u8]) -> Vec<f32> {
         .collect()
 }
 
-fn ingest(
-    mut out: ChildStdout,
-    mut err: Option<ChildStderr>,
-    tx: &SyncSender<Chunk>,
-    cancel: &AtomicBool,
-) {
-    let mut bytes = vec![0u8; CHUNK * 4];
-    let mut total = 0usize;
-    while !cancel.load(Ordering::Relaxed) {
-        let n = match read_full(&mut out, &mut bytes) {
+/// keep the tail of ffmpeg's diagnostics. a broken file can write megabytes of
+/// noise to stderr; printing all of it would be its own kind of failure.
+const STDERR_TAIL: usize = 8 * 1024;
+
+fn drain_stderr(mut err: ChildStderr) -> Vec<u8> {
+    let mut buf = [0u8; 4096];
+    let mut tail: Vec<u8> = Vec::new();
+    loop {
+        match err.read(&mut buf) {
             Ok(0) | Err(_) => break,
-            Ok(n) => n,
+            Ok(n) => {
+                tail.extend_from_slice(&buf[..n]);
+                if tail.len() > STDERR_TAIL {
+                    let drop = tail.len() - STDERR_TAIL;
+                    tail.drain(..drop);
+                }
+            }
+        }
+    }
+    tail
+}
+
+struct Ingest {
+    reader: Option<thread::JoinHandle<usize>>,
+    diagnostics: Option<thread::JoinHandle<Vec<u8>>>,
+    children: Children,
+}
+
+impl Ingest {
+    /// join both readers. stderr is drained on its own thread so a chatty
+    /// decoder cannot fill its pipe and stall the stdout reader forever.
+    fn finish(mut self) -> (usize, String) {
+        let total = self.reader.take().and_then(|h| h.join().ok()).unwrap_or(0);
+        let tail = self
+            .diagnostics
+            .take()
+            .and_then(|h| h.join().ok())
+            .unwrap_or_default();
+        (total, first_line(&tail))
+    }
+}
+
+impl Drop for Ingest {
+    fn drop(&mut self) {
+        // a cancelled job can return before the readers see eof. kill the
+        // decoder so their blocking reads end, then join them: no detached
+        // reader may outlive the job it was reading for.
+        kill_all(&self.children);
+        if let Some(h) = self.reader.take() {
+            let _ = h.join();
+        }
+        if let Some(h) = self.diagnostics.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+fn spawn_ingest(
+    mut out: ChildStdout,
+    err: ChildStderr,
+    tx: SyncSender<Chunk>,
+    cancel: Arc<AtomicBool>,
+    children: Children,
+) -> Ingest {
+    let diagnostics = thread::Builder::new()
+        .name("scribe-stderr".into())
+        .spawn(move || drain_stderr(err))
+        .expect("stderr drainer must start");
+    let reader = thread::Builder::new()
+        .name("scribe-ingest".into())
+        .spawn(move || {
+            let mut bytes = vec![0u8; CHUNK * 4];
+            let mut total = 0usize;
+            while !cancel.load(Ordering::Relaxed) {
+                let n = match read_full(&mut out, &mut bytes) {
+                    Ok(0) => break,
+                    Ok(n) => n,
+                    Err(e) => {
+                        if !cancel.load(Ordering::Relaxed) {
+                            let _ = tx
+                                .send(Chunk::Failed(format!("could not read decoded audio: {e}")));
+                        }
+                        return total;
+                    }
+                };
+                let samples = bytes_to_f32(&bytes[..n - n % 4]);
+                total += samples.len();
+                if tx.send(Chunk::Samples(samples)).is_err() {
+                    return total;
+                }
+                if n < bytes.len() {
+                    break;
+                }
+            }
+            total
+        })
+        .expect("ingest reader must start");
+    Ingest {
+        reader: Some(reader),
+        diagnostics: Some(diagnostics),
+        children,
+    }
+}
+
+/// collect the decoder's exit status. a clean eof from stdout is not a clean
+/// decode if ffmpeg died halfway through: partial pcm is not a transcript.
+fn decoder_status(children: &Children, cancel: &AtomicBool) -> Result<(), String> {
+    let Ok(mut list) = children.lock() else {
+        return Ok(());
+    };
+    for child in list.iter_mut() {
+        let status = if cancel.load(Ordering::Relaxed) {
+            let _ = child.kill();
+            child.wait().ok()
+        } else {
+            child.wait().ok()
         };
-        let samples = bytes_to_f32(&bytes[..n - n % 4]);
-        total += samples.len();
-        if tx.send(Chunk::Samples(samples)).is_err() {
-            return;
-        }
-        if n < bytes.len() {
-            break;
+        match status {
+            Some(status) if status.success() => {}
+            Some(status) => return Err(format!("decoder exited with {status}")),
+            None => return Err("could not read the decoder's exit status".into()),
         }
     }
-    if total == 0 && !cancel.load(Ordering::Relaxed) {
-        let mut text = Vec::new();
-        if let Some(e) = err.as_mut() {
-            let _ = e.read_to_end(&mut text);
-        }
-        let detail = first_line(&text);
-        let msg = format!("could not read audio from that file: {detail}");
-        let _ = tx.send(Chunk::Failed(msg));
-    }
+    list.clear();
+    Ok(())
 }
 
 /// youtube audio lands in a temp file. this makes sure it disappears when we
@@ -358,6 +546,7 @@ impl Drop for TempAudio {
 
 fn pipeline(
     job: &Job,
+    job_id: u64,
     tx: &Sender<Event>,
     cancel: &Arc<AtomicBool>,
     paused: &Arc<AtomicBool>,
@@ -366,7 +555,7 @@ fn pipeline(
     let url = is_url(&job.source);
     check_tools(url)?;
 
-    let _ = tx.send(Event::Stage(Stage::Fetching));
+    let _ = tx.send(Event::new(job_id, EventKind::Stage(Stage::Fetching)));
     let decoded_source: PathBuf;
     let (title, duration) = if url {
         // the crate installs its binaries and gives us real metadata from
@@ -385,7 +574,7 @@ fn pipeline(
         local_info(&job.source)
     };
     let _temp = TempAudio(decoded_source.clone(), url);
-    let _ = tx.send(Event::Info { title, duration });
+    let _ = tx.send(Event::new(job_id, EventKind::Info { title, duration }));
     wait_while_paused(cancel, paused);
     if cancel.load(Ordering::Relaxed) {
         return Ok(());
@@ -395,7 +584,7 @@ fn pipeline(
     // do not clobber the alternate screen buffer.
     whisper_rs::install_logging_hooks();
 
-    let _ = tx.send(Event::Stage(Stage::Loading));
+    let _ = tx.send(Event::new(job_id, EventKind::Stage(Stage::Loading)));
     let mut cparams = WhisperContextParameters::default();
     cparams.use_gpu(false);
     let ctx = WhisperContext::new_with_params(&job.model, cparams)
@@ -411,19 +600,15 @@ fn pipeline(
 
     let (out, err) = start_decoder(&decoded_source, children)?;
     let (chunk_tx, chunk_rx) = mpsc::sync_channel::<Chunk>(48);
-    {
-        let cancel = cancel.clone();
-        thread::Builder::new()
-            .name("scribe-ingest".into())
-            .spawn(move || ingest(out, err, &chunk_tx, &cancel))
-            .map_err(|e| format!("could not start the ingest thread: {e}"))?;
-    }
+    let ingest = spawn_ingest(out, err, chunk_tx, cancel.clone(), children.clone());
 
-    let _ = tx.send(Event::Stage(Stage::Transcribing));
+    let _ = tx.send(Event::new(job_id, EventKind::Stage(Stage::Transcribing)));
     // borrow a local String into FullParams instead of leaking it: repeated
     // transcription jobs used to allocate a permanent 'static str per job.
     let lang: String = if multilingual {
-        job.lang.clone().unwrap_or_else(|| "auto".into())
+        let chosen = job.lang.clone().unwrap_or_else(|| "auto".into());
+        crate::util::validate_language(&chosen)?;
+        chosen
     } else {
         "en".into()
     };
@@ -460,7 +645,7 @@ fn pipeline(
             return Ok(());
         }
         let avail = buf.len() - (cursor - base);
-        if avail == 0 || (eof && avail < MIN_TAIL) {
+        if avail == 0 {
             break;
         }
         let n = avail.min(WINDOW);
@@ -474,7 +659,10 @@ fn pipeline(
             (&buf[start..start + n]).into()
         };
 
-        let _ = tx.send(Event::Envelope(envelope(&window[..n], ENVELOPE_BUCKETS)));
+        let _ = tx.send(Event::new(
+            job_id,
+            EventKind::Envelope(envelope(&window[..n], ENVELOPE_BUCKETS)),
+        ));
         let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
         params.set_n_threads(job.threads);
         params.set_language(Some(lang.as_str()));
@@ -496,9 +684,12 @@ fn pipeline(
         let win_n = n;
         params.set_progress_callback_safe(move |pct: i32| {
             let cur = base_cursor + ((pct.clamp(0, 100) as f64 / 100.0) * win_n as f64) as usize;
-            let _ = tx_prog.send(Event::Progress {
-                done_s: cur as f64 / SAMPLE_RATE as f64,
-            });
+            let _ = tx_prog.send(Event::new(
+                job_id,
+                EventKind::Progress {
+                    done_s: cur as f64 / SAMPLE_RATE as f64,
+                },
+            ));
         });
 
         let window_segments: Vec<Segment> = {
@@ -517,6 +708,11 @@ fn pipeline(
                     return Ok(());
                 }
                 return Err(format!("whisper failed on this window: {e}"));
+            }
+            // the callback may have kept sending progress while the user hit
+            // stop. don't let a cancelled window leak into the transcript.
+            if cancel.load(Ordering::Relaxed) {
+                return Ok(());
             }
             let mut segments = seg_tx.lock().map(|v| v.clone()).unwrap_or_default();
             // attach word timings from the token data, matched to their segment.
@@ -568,7 +764,7 @@ fn pipeline(
                 .is_some_and(|(text, end)| *text == seg.text && seg.start_cs < *end);
             if !duplicate && seg.end_cs > seg.start_cs {
                 last_emitted = Some((seg.text.clone(), seg.end_cs));
-                let _ = tx.send(Event::Segment(seg));
+                let _ = tx.send(Event::new(job_id, EventKind::Segment(seg)));
             }
         }
 
@@ -578,14 +774,34 @@ fn pipeline(
             advance_cs as usize * (SAMPLE_RATE / 100)
         };
         cursor += advance.max(1);
-        let _ = tx.send(Event::Progress {
-            done_s: cursor as f64 / SAMPLE_RATE as f64,
-        });
+        let _ = tx.send(Event::new(
+            job_id,
+            EventKind::Progress {
+                done_s: cursor as f64 / SAMPLE_RATE as f64,
+            },
+        ));
 
         if cursor - base >= WINDOW {
             buf.drain(..cursor - base);
             base = cursor;
         }
+    }
+    // wait for the decoder before joining the readers: killing the child in
+    // Ingest::drop would make its exit status meaningless.
+    let status = decoder_status(children, cancel);
+    let (total_samples, detail) = ingest.finish();
+    if let Err(status) = status {
+        if cancel.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        return Err(format!(
+            "decoder failed after {total_samples} samples: {status} {detail}"
+        ));
+    }
+    if total_samples == 0 && !cancel.load(Ordering::Relaxed) {
+        return Err(format!(
+            "no audio could be decoded from that file. {detail}"
+        ));
     }
     Ok(())
 }
@@ -716,14 +932,17 @@ mod tests {
             lang: None,
             translate: false,
         };
-        let handle = spawn(job, tx);
+        let handle = spawn(job, tx, 7);
         // drain stage events until the terminal one. a hang here would be a
         // stuck worker thread that never reports success, failure or cancel.
         let mut terminal = false;
         let deadline = std::time::Instant::now() + Duration::from_secs(3);
         while std::time::Instant::now() < deadline {
             match rx.recv_timeout(Duration::from_millis(100)) {
-                Ok(Event::Error(_) | Event::Cancelled | Event::Done) => {
+                Ok(Event {
+                    job_id: 7,
+                    kind: EventKind::Error(_) | EventKind::Cancelled | EventKind::Done,
+                }) => {
                     terminal = true;
                     break;
                 }
@@ -746,10 +965,134 @@ mod tests {
             lang: None,
             translate: false,
         };
-        let handle = spawn(job, tx);
+        let handle = spawn(job, tx, 8);
         handle.cancel();
         handle.cancel();
         drop(handle);
+    }
+
+    #[cfg(unix)]
+    fn fake_decoder(script: &str) -> Command {
+        let mut command = Command::new("sh");
+        command.arg("-c").arg(script);
+        command
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn decoder_drains_large_stderr_without_deadlock() {
+        let children: Children = Arc::new(Mutex::new(Vec::new()));
+        let (out, err) = start_decoder_with(
+            Path::new("ignored"),
+            &children,
+            fake_decoder("yes abcdefghijklmnopqrstuvwxyz | head -c 2000000 >&2; printf '\\000\\000\\200\\077'"),
+        )
+        .unwrap();
+        let (chunk_tx, chunk_rx) = mpsc::sync_channel(4);
+        let ingest = spawn_ingest(
+            out,
+            err,
+            chunk_tx,
+            Arc::new(AtomicBool::new(false)),
+            children.clone(),
+        );
+        let mut samples = 0;
+        while let Ok(chunk) = chunk_rx.recv() {
+            if let Chunk::Samples(s) = chunk {
+                samples += s.len();
+            }
+        }
+        let (total, _) = ingest.finish();
+        assert_eq!(total, 1);
+        assert_eq!(samples, 1);
+        decoder_status(&children, &AtomicBool::new(false)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn decoder_nonzero_exit_is_reported_even_with_partial_output() {
+        let children: Children = Arc::new(Mutex::new(Vec::new()));
+        let (out, err) = start_decoder_with(
+            Path::new("ignored"),
+            &children,
+            fake_decoder("printf '\\000\\000\\200\\077'; echo 'bad frame' >&2; exit 3"),
+        )
+        .unwrap();
+        let (chunk_tx, chunk_rx) = mpsc::sync_channel(4);
+        let ingest = spawn_ingest(
+            out,
+            err,
+            chunk_tx,
+            Arc::new(AtomicBool::new(false)),
+            children.clone(),
+        );
+        drop(chunk_rx);
+        let (total, detail) = ingest.finish();
+        assert_eq!(total, 1);
+        assert_eq!(detail, "bad frame");
+        let status = decoder_status(&children, &AtomicBool::new(false)).unwrap_err();
+        assert!(status.contains("exit status: 3"), "{status}");
+    }
+
+    #[test]
+    fn stderr_tail_is_bounded() {
+        let data = vec![b'x'; 100_000];
+        let mut reader = std::io::Cursor::new(data);
+        let mut tail = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    tail.extend_from_slice(&buf[..n]);
+                    if tail.len() > STDERR_TAIL {
+                        let drop = tail.len() - STDERR_TAIL;
+                        tail.drain(..drop);
+                    }
+                }
+            }
+        }
+        assert_eq!(tail.len(), STDERR_TAIL);
+    }
+
+    #[test]
+    fn url_preflight_does_not_demand_a_local_ffmpeg() {
+        // url jobs install ffmpeg during fetch. demanding it before that point
+        // was the old first-run false alarm.
+        assert!(check_tools(true).is_ok());
+    }
+
+    #[test]
+    fn ffmpeg_resolution_is_consistent() {
+        match resolve_ffmpeg() {
+            Ok(path) => {
+                assert!(Command::new(&path).arg("-version").output().is_ok());
+            }
+            Err(e) => assert!(e.contains("ffmpeg is not installed")),
+        }
+    }
+
+    #[test]
+    fn job_ids_are_monotonic() {
+        assert!(next_job_id() > 0);
+        let a = next_job_id();
+        let b = next_job_id();
+        assert!(b > a);
+    }
+
+    #[test]
+    fn handle_reports_its_job_id() {
+        let (tx, _rx) = mpsc::channel();
+        let job = Job {
+            source: "/definitely/missing.wav".into(),
+            model: PathBuf::from("/definitely/missing-model.bin"),
+            threads: 1,
+            lang: None,
+            translate: false,
+        };
+        let handle = spawn(job, tx, 99);
+        assert_eq!(handle.job_id(), 99);
+        handle.stop();
     }
 
     #[test]

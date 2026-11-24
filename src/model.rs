@@ -10,7 +10,8 @@ use sha2::{Digest, Sha256};
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Instant, SystemTime};
 
 pub const BASE_URL: &str = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main";
 
@@ -411,16 +412,7 @@ pub fn find(key: &str) -> Option<&'static ModelInfo> {
 /// where models live. xdg if you have it, ~/.cache if you do not. i am not
 /// going to guess three more conventions and make a mess of your home dir.
 pub fn cache_dir() -> PathBuf {
-    if let Ok(xdg) = std::env::var("XDG_CACHE_HOME")
-        && !xdg.is_empty()
-    {
-        return PathBuf::from(xdg).join("scribe").join("models");
-    }
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-    PathBuf::from(home)
-        .join(".cache")
-        .join("scribe")
-        .join("models")
+    crate::util::cache_home().join("scribe").join("models")
 }
 
 /// What a `--model`/saved value can refer to. Keeping the three forms distinct
@@ -465,6 +457,61 @@ pub fn classify(input: &str) -> Result<ModelRef, String> {
     Ok(ModelRef::Path(path))
 }
 
+/// fingerprint used to invalidate cached verification results. if the file
+/// changed in any way, the old "verified" stamp is worthless.
+type Verified = Mutex<std::collections::HashMap<PathBuf, (u64, SystemTime)>>;
+static VERIFIED: OnceLock<Verified> = OnceLock::new();
+
+fn fingerprint(path: &Path) -> Option<(u64, SystemTime)> {
+    let meta = fs::metadata(path).ok()?;
+    Some((meta.len(), meta.modified().ok()?))
+}
+
+/// validate a catalog model once per version of the file. truncated, corrupted
+/// and interrupted downloads are rejected before whisper ever sees them.
+pub fn validate_cached(info: &ModelInfo, path: &Path) -> Result<(), String> {
+    let stamp = fingerprint(path);
+    let cache = VERIFIED.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+    if let (Some(stamp), Ok(map)) = (stamp, cache.lock())
+        && map.get(path) == Some(&stamp)
+    {
+        return Ok(());
+    }
+    verify_model(info, path)?;
+    if let (Some(stamp), Ok(mut map)) = (stamp, cache.lock()) {
+        map.insert(path.to_path_buf(), stamp);
+    }
+    Ok(())
+}
+
+/// custom models have no authoritative checksum in the catalog. the least we
+/// can do is reject empty stubs and files that cannot possibly be ggml models.
+pub fn validate_custom(path: &Path) -> Result<(), String> {
+    let len = fs::metadata(path)
+        .map_err(|e| format!("cannot inspect {}: {e}", path.display()))?
+        .len();
+    if len < 1024 {
+        return Err(format!(
+            "{} is only {} bytes; that is not a model. pass a real ggml .bin file",
+            path.display(),
+            len
+        ));
+    }
+    let mut magic = [0u8; 4];
+    use std::io::Read;
+    if let Ok(mut file) = File::open(path)
+        && file.read_exact(&mut magic).is_ok()
+        && &magic != b"ggml"
+        && &magic != b"GGUF"
+    {
+        return Err(format!(
+            "{} does not look like a ggml model (bad header). refusing to hand it to whisper",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
 /// Resolve a single model reference to a usable file. `None` means "use the
 /// first cached model", which keeps the old no-flags workflow working.
 pub fn resolve(input: Option<&str>) -> Result<(String, PathBuf), String> {
@@ -474,25 +521,19 @@ pub fn resolve(input: Option<&str>) -> Result<(String, PathBuf), String> {
     match classify(input)? {
         ModelRef::Catalog(info) => {
             let path = cache_dir().join(info.file);
-            if path.is_file() {
-                let actual = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-                if actual < min_size(info) {
-                    return Err(format!(
-                        "{} looks incomplete ({} of {} MiB). remove it from the model picker and download it again",
-                        info.key,
-                        actual / (1024 * 1024),
-                        info.size_mib
-                    ));
-                }
-                Ok((info.label.to_string(), path))
-            } else {
-                Err(format!(
+            if !path.is_file() {
+                return Err(format!(
                     "{} is a valid model but is not downloaded yet ({} MiB). open the model picker with m, or pass --model <path>",
                     info.key, info.size_mib
-                ))
+                ));
             }
+            validate_cached(info, &path).map_err(|e| {
+                format!("cached {} failed verification: {e}. remove it from the model picker and download it again", info.key)
+            })?;
+            Ok((info.label.to_string(), path))
         }
         ModelRef::Path(path) => {
+            validate_custom(&path)?;
             let label = path
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
@@ -502,20 +543,33 @@ pub fn resolve(input: Option<&str>) -> Result<(String, PathBuf), String> {
     }
 }
 
-/// First cached catalog model, in catalog order. Used when no model was given.
+/// First valid cached catalog model, in catalog order. A corrupt file does not
+/// block a different, intact model from being used.
 pub fn resolve_cached() -> Result<(String, PathBuf), String> {
     let dir = cache_dir();
+    let mut corrupt = Vec::new();
     for info in CATALOG {
         let path = dir.join(info.file);
-        if path.is_file() {
-            return Ok((info.label.to_string(), path));
+        if !path.is_file() {
+            continue;
+        }
+        match validate_cached(info, &path) {
+            Ok(()) => return Ok((info.label.to_string(), path)),
+            Err(e) => corrupt.push(format!("{}: {e}", info.key)),
         }
     }
-    Err(format!(
-        "no model cached. open the picker with m and grab {} ({} MiB), or pass --model <path>",
-        default_model().label,
-        default_model().size_mib
-    ))
+    if corrupt.is_empty() {
+        Err(format!(
+            "no model cached. open the picker with m and grab {} ({} MiB), or pass --model <path>",
+            default_model().label,
+            default_model().size_mib
+        ))
+    } else {
+        Err(format!(
+            "every cached model failed verification ({}). remove the bad files in the model picker and download again",
+            corrupt.join("; ")
+        ))
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -638,6 +692,52 @@ pub fn remove_model(info: &ModelInfo) -> Result<(), String> {
     Ok(())
 }
 
+/// one process at a time may touch a given partial file. without this, two
+/// scribes can append to the same `.part` and each verify the other's debris.
+#[derive(Debug)]
+struct DownloadLock(PathBuf);
+
+impl DownloadLock {
+    fn acquire(dir: &Path, file: &str) -> Result<Self, String> {
+        let path = dir.join(format!(".{file}.lock"));
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(_) => Ok(Self(path)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                let stale = fs::metadata(&path)
+                    .and_then(|m| m.modified())
+                    .map(|t| t.elapsed().unwrap_or_default() > std::time::Duration::from_secs(600))
+                    .unwrap_or(true);
+                if stale {
+                    let _ = fs::remove_file(&path);
+                    if fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(&path)
+                        .is_ok()
+                    {
+                        return Ok(Self(path));
+                    }
+                }
+                Err(format!(
+                    "another scribe is downloading {file}. wait for it to finish (or remove the stale lock at {})",
+                    path.display()
+                ))
+            }
+            Err(e) => Err(format!("cannot create download lock: {e}")),
+        }
+    }
+}
+
+impl Drop for DownloadLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
 /// download to a .part file, verify size and sha256, then rename. the rename is
 /// the commit point: until then, nothing in the cache claims to be a model.
 pub fn download(
@@ -658,6 +758,7 @@ fn download_from(
     on_progress: impl Fn(DownloadProgress),
 ) -> Result<PathBuf, String> {
     fs::create_dir_all(&dir).map_err(|e| format!("cannot create model directory: {e}"))?;
+    let _lock = DownloadLock::acquire(&dir, info.file)?;
     let final_path = dir.join(info.file);
     let part = dir.join(format!("{}.part", info.file));
     let url = format!("{}/{}", base_url.trim_end_matches('/'), info.file);
@@ -938,7 +1039,9 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("scribe-resolve-{}", std::process::id()));
         let _ = fs::create_dir_all(&dir);
         let file = dir.join("my-voice.bin");
-        fs::write(&file, b"x").unwrap();
+        let mut model = b"ggml".to_vec();
+        model.resize(2048, 0);
+        fs::write(&file, &model).unwrap();
         let (label, path) = resolve(Some(file.to_str().unwrap())).unwrap();
         assert_eq!(label, "my-voice.bin");
         assert_eq!(path, file);
@@ -1125,6 +1228,67 @@ mod tests {
         fs::remove_file(&file).unwrap();
         assert!(verify_model(&info, &file).is_err());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn concurrent_download_lock_is_exclusive() {
+        let dir = std::env::temp_dir().join(format!(
+            "scribe-lock-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let first = DownloadLock::acquire(&dir, "ggml-test.bin").unwrap();
+        let second = DownloadLock::acquire(&dir, "ggml-test.bin");
+        assert!(second.is_err());
+        assert!(second.unwrap_err().contains("another scribe"));
+        drop(first);
+        assert!(DownloadLock::acquire(&dir, "ggml-test.bin").is_ok());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn validate_custom_rejects_stubs_and_wrong_headers() {
+        let dir = std::env::temp_dir().join(format!("scribe-custom-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let stub = dir.join("stub.bin");
+        fs::write(&stub, b"tiny").unwrap();
+        assert!(validate_custom(&stub).unwrap_err().contains("not a model"));
+        let fake = dir.join("fake.bin");
+        fs::write(&fake, vec![0u8; 2048]).unwrap();
+        assert!(
+            validate_custom(&fake)
+                .unwrap_err()
+                .contains("does not look like")
+        );
+        let good = dir.join("good.bin");
+        let mut data = b"ggml".to_vec();
+        data.resize(2048, 0);
+        fs::write(&good, &data).unwrap();
+        assert!(validate_custom(&good).is_ok());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn cached_verification_is_invalidated_when_the_file_changes() {
+        let info = tiny_info("2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824");
+        let dir = std::env::temp_dir().join(format!(
+            "scribe-verify-cache-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::create_dir_all(&dir);
+        let file = dir.join(info.file);
+        fs::write(&file, b"hello").unwrap();
+        assert!(validate_cached(&info, &file).is_ok());
+        assert!(validate_cached(&info, &file).is_ok());
+        fs::write(&file, b"world").unwrap();
+        assert!(validate_cached(&info, &file).is_err());
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

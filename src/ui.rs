@@ -6,7 +6,9 @@ use crate::anim;
 use crate::app::{App, DownloadState, Focus, Overlay, Status};
 use crate::model;
 use crate::theme::Palette;
-use crate::util::{duration_short, is_url, pad_to, timestamp_short, truncate, wrap};
+use crate::util::{
+    duration_short, is_url, pad_to, sanitize_terminal, timestamp_short, truncate, wrap,
+};
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
@@ -266,7 +268,7 @@ fn render_header(f: &mut Frame, area: Rect, app: &App) {
     let source = if app.title.is_empty() {
         "awaiting audio source".to_string()
     } else {
-        format!("{}{duration_tag}", app.title)
+        format!("{}{duration_tag}", sanitize_terminal(&app.title))
     };
 
     let dl = if app.download == DownloadState::Downloading {
@@ -372,17 +374,7 @@ fn render_transcript(f: &mut Frame, area: Rect, app: &mut App) {
         return;
     }
 
-    let mut visual_lines: Vec<(usize, String, usize)> = Vec::new();
-    let mut selected_line = 0usize;
-    for (idx, seg) in app.segments.iter().enumerate() {
-        let wrapped = wrap(&seg.text, text_w);
-        if idx == app.selected {
-            selected_line = visual_lines.len();
-        }
-        for (li, line) in wrapped.into_iter().enumerate() {
-            visual_lines.push((idx, line, li));
-        }
-    }
+    let (visual_lines, selected_line) = app.visual_lines(text_w);
 
     let visible = inner.height as usize;
     let max_scroll = visual_lines.len().saturating_sub(visible);
@@ -957,13 +949,14 @@ fn render_completion_popup(f: &mut Frame, input_area: Rect, app: &App) {
 // source / input pane
 fn render_input(f: &mut Frame, area: Rect, app: &App) {
     let inner = floating_dock(f, area, "source", app.focus == Focus::Input);
+    let cleaned = sanitize_terminal(&app.input);
     let (text, color) = if app.input.is_empty() {
         (
             "paste file path or http(s) url here…  (tab: complete  enter: start)",
             f.palette.muted,
         )
     } else {
-        (app.input.as_str(), f.palette.text)
+        (cleaned.as_str(), f.palette.text)
     };
 
     let cursor = if app.focus == Focus::Input {
@@ -1918,7 +1911,7 @@ fn render_toasts(f: &mut Frame, app: &App) {
     let mut cursor = f.area.bottom().saturating_sub(1);
 
     for toast in shown {
-        let lines = wrap(&toast.text, max_w.saturating_sub(4));
+        let lines = wrap(&sanitize_terminal(&toast.text), max_w.saturating_sub(4));
         let h = (lines.len() as u16 + 2).min(6);
         if h + 1 > cursor.saturating_sub(f.area.y) {
             break;
@@ -1951,7 +1944,10 @@ fn render_toasts(f: &mut Frame, app: &App) {
         let inner = block.inner(*area);
         block.render(*area, f.buf);
         clear_transparent(f.buf, inner);
-        let lines = wrap(&toast.text, inner.width.saturating_sub(1) as usize);
+        let lines = wrap(
+            &sanitize_terminal(&toast.text),
+            inner.width.saturating_sub(1) as usize,
+        );
         for (row, line) in lines.iter().take(inner.height as usize).enumerate() {
             Span::styled(line.clone(), Style::default().fg(f.palette.text)).render(
                 Rect::new(inner.x, inner.y + row as u16, inner.width, 1),
@@ -1964,7 +1960,10 @@ fn render_toasts(f: &mut Frame, app: &App) {
 // notice / error message
 fn render_message(f: &mut Frame, app: &App) {
     let popup_w = f.area.width.min(66);
-    let text = wrap(&app.message, popup_w.saturating_sub(6) as usize);
+    let text = wrap(
+        &sanitize_terminal(&app.message),
+        popup_w.saturating_sub(6) as usize,
+    );
     let popup_h = (text.len() as u16 + 4).min(12);
     let px = f.area.x + (f.area.width.saturating_sub(popup_w)) / 2;
     let py = f.area.y + (f.area.height.saturating_sub(popup_h)) / 2;

@@ -59,17 +59,44 @@ pub fn human_bytes(bytes: u64) -> String {
 /// protocol even if it looks like one.
 ///
 pub fn is_url(s: &str) -> bool {
-    let lower = s.trim().to_ascii_lowercase();
-    lower.starts_with("http://") || lower.starts_with("https://")
+    parse_http_url(s).is_some()
 }
 
-/// is this a youtube link? those get clickable timestamps in markdown export,
-/// because that is a nice trick and it costs us three string checks.
+/// just enough url parsing to reject junk without pulling in a url crate. we
+/// care about scheme + host, not about the entire rfc. a filename with a colon
+/// or a dot is still a filename.
+pub fn parse_http_url(s: &str) -> Option<(String, String)> {
+    let s = s.trim();
+    let (scheme, rest) = s.split_once("://")?;
+    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+        return None;
+    }
+    let authority = rest.split(['/', '?', '#']).next()?;
+    let host = authority
+        .rsplit('@')
+        .next()?
+        .split(':')
+        .next()?
+        .trim_matches(['[', ']']);
+    if host.is_empty() || host.chars().any(|c| c.is_whitespace()) {
+        return None;
+    }
+    Some((scheme.to_ascii_lowercase(), host.to_ascii_lowercase()))
+}
+
+fn host_matches(url: &str, hosts: &[&str]) -> bool {
+    parse_http_url(url).is_some_and(|(_, host)| {
+        hosts
+            .iter()
+            .any(|h| host == *h || host.ends_with(&format!(".{h}")))
+    })
+}
+
+/// is this a youtube link? those get clickable timestamps in markdown export.
+/// host matching, not substring matching: `notyoutube.com.evil.test` is not
+/// youtube, however much it would like the markdown link to say otherwise.
 pub fn is_youtube_url(s: &str) -> bool {
-    let lower = s.to_ascii_lowercase();
-    lower.contains("youtube.com/")
-        || lower.contains("youtu.be/")
-        || lower.contains("youtube-nocookie.com/")
+    host_matches(s, &["youtube.com", "youtu.be", "youtube-nocookie.com"])
 }
 
 /// dig the video id out of a youtube url. handles the three shapes people
@@ -79,25 +106,38 @@ pub fn youtube_id(s: &str) -> Option<String> {
         let value = value.split(['?', '#', '/']).next()?.trim();
         (!value.is_empty()).then(|| value.to_string())
     }
-    let lower = s.to_ascii_lowercase();
-    if lower.contains("youtu.be/") {
-        return non_empty(s.split("youtu.be/").nth(1)?);
+    let (_, host) = parse_http_url(s)?;
+    let after_scheme = s.split_once("://")?.1;
+    let after_host = after_scheme
+        .find(['/', '?', '#'])
+        .map(|i| &after_scheme[i..])
+        .unwrap_or("");
+    let (path_and_query, _) = after_host.split_once('#').unwrap_or((after_host, ""));
+    let (path, query) = path_and_query
+        .split_once('?')
+        .unwrap_or((path_and_query, ""));
+    if host == "youtu.be" || host.ends_with(".youtu.be") {
+        return non_empty(path.trim_start_matches('/'));
     }
-    if lower.contains("youtube.com/watch") {
-        let rest = s.split('?').nth(1)?;
-        for pair in rest.split('&') {
+    if host == "youtube.com"
+        || host.ends_with(".youtube.com")
+        || host == "youtube-nocookie.com"
+        || host.ends_with(".youtube-nocookie.com")
+    {
+        for pair in query.split('&') {
             if let Some(v) = pair.strip_prefix("v=") {
                 return non_empty(v);
             }
         }
-    }
-    if lower.contains("youtube.com/embed/") || lower.contains("youtube.com/shorts/") {
-        let marker = if lower.contains("/embed/") {
-            "/embed/"
-        } else {
-            "/shorts/"
-        };
-        return non_empty(s.split(marker).nth(1)?);
+        for marker in ["embed", "shorts"] {
+            if let Some(rest) = path
+                .trim_start_matches('/')
+                .strip_prefix(marker)
+                .and_then(|p| p.strip_prefix('/'))
+            {
+                return non_empty(rest);
+            }
+        }
     }
     None
 }
@@ -109,18 +149,165 @@ pub fn youtube_link(source: &str, cs: i64) -> Option<String> {
     Some(format!("https://www.youtube.com/watch?v={id}&t={secs}s"))
 }
 
+/// `auto` plus the languages whisper actually knows. names are for humans;
+/// `whisper_rs::get_lang_id` is the authority on whether a code is real.
+pub const LANGUAGES: &[(&str, &str)] = &[
+    ("auto", "detect automatically"),
+    ("en", "english"),
+    ("zh", "chinese"),
+    ("de", "german"),
+    ("es", "spanish"),
+    ("ru", "russian"),
+    ("ko", "korean"),
+    ("fr", "french"),
+    ("ja", "japanese"),
+    ("pt", "portuguese"),
+    ("tr", "turkish"),
+    ("pl", "polish"),
+    ("ca", "catalan"),
+    ("nl", "dutch"),
+    ("ar", "arabic"),
+    ("sv", "swedish"),
+    ("it", "italian"),
+    ("id", "indonesian"),
+    ("hi", "hindi"),
+    ("fi", "finnish"),
+    ("vi", "vietnamese"),
+    ("he", "hebrew"),
+    ("uk", "ukrainian"),
+    ("el", "greek"),
+    ("ms", "malay"),
+    ("cs", "czech"),
+    ("ro", "romanian"),
+    ("da", "danish"),
+    ("hu", "hungarian"),
+    ("ta", "tamil"),
+    ("no", "norwegian"),
+    ("th", "thai"),
+    ("ur", "urdu"),
+    ("hr", "croatian"),
+    ("bg", "bulgarian"),
+    ("lt", "lithuanian"),
+    ("la", "latin"),
+    ("mi", "maori"),
+    ("ml", "malayalam"),
+    ("cy", "welsh"),
+    ("sk", "slovak"),
+    ("te", "telugu"),
+    ("fa", "persian"),
+    ("lv", "latvian"),
+    ("bn", "bengali"),
+    ("sr", "serbian"),
+    ("az", "azerbaijani"),
+    ("sl", "slovenian"),
+    ("kn", "kannada"),
+    ("et", "estonian"),
+    ("mk", "macedonian"),
+    ("br", "breton"),
+    ("eu", "basque"),
+    ("is", "icelandic"),
+    ("hy", "armenian"),
+    ("ne", "nepali"),
+    ("mn", "mongolian"),
+    ("bs", "bosnian"),
+    ("kk", "kazakh"),
+    ("sq", "albanian"),
+    ("sw", "swahili"),
+    ("gl", "galician"),
+    ("mr", "marathi"),
+    ("pa", "punjabi"),
+    ("si", "sinhala"),
+    ("km", "khmer"),
+    ("my", "burmese"),
+    ("am", "amharic"),
+    ("yi", "yiddish"),
+    ("lo", "lao"),
+    ("dz", "dzongkha"),
+    ("jv", "javanese"),
+    ("su", "sundanese"),
+];
+
+pub fn validate_language(code: &str) -> Result<(), String> {
+    if code == "auto" || LANGUAGES.iter().any(|(c, _)| *c == code) {
+        return Ok(());
+    }
+    if whisper_rs::get_lang_id(code).is_some() {
+        return Ok(());
+    }
+    Err(format!(
+        "unknown language code '{code}'. try 'auto' or a two-letter code from whisper's language list"
+    ))
+}
+
+pub fn language_name(code: &str) -> Option<&'static str> {
+    LANGUAGES
+        .iter()
+        .find(|(c, _)| *c == code)
+        .map(|(_, name)| *name)
+}
+
+/// where user data goes, without dragging in a directories crate. the last
+/// resort is a temp dir, never the current working directory: dropping a
+/// config in a random repo is worse than admitting we have no home directory.
+pub fn cache_home() -> PathBuf {
+    if let Some(xdg) = std::env::var_os("XDG_CACHE_HOME").filter(|v| !v.is_empty()) {
+        return PathBuf::from(xdg);
+    }
+    if cfg!(target_os = "macos")
+        && let Some(home) = home_dir()
+    {
+        return home.join("Library").join("Caches");
+    }
+    if cfg!(windows)
+        && let Some(local) = std::env::var_os("LOCALAPPDATA").filter(|v| !v.is_empty())
+    {
+        return PathBuf::from(local);
+    }
+    home_dir()
+        .map(|h| h.join(".cache"))
+        .unwrap_or_else(|| std::env::temp_dir().join("scribe-no-home"))
+}
+
+pub fn config_home() -> PathBuf {
+    if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
+        return PathBuf::from(xdg);
+    }
+    if cfg!(target_os = "macos")
+        && let Some(home) = home_dir()
+    {
+        return home.join("Library").join("Application Support");
+    }
+    if cfg!(windows)
+        && let Some(appdata) = std::env::var_os("APPDATA").filter(|v| !v.is_empty())
+    {
+        return PathBuf::from(appdata);
+    }
+    home_dir()
+        .map(|h| h.join(".config"))
+        .unwrap_or_else(|| std::env::temp_dir().join("scribe-no-home"))
+}
+
+pub fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("USERPROFILE")
+                .filter(|v| !v.is_empty())
+                .map(PathBuf::from)
+        })
+}
+
 /// expand `~` ourselves. the shell is not involved when a user pastes a path
 /// into a text box, so somebody has to do it.
 pub fn expand_tilde(path: &str) -> PathBuf {
     if path == "~" {
-        return std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("~"));
+        return home_dir().unwrap_or_else(|| PathBuf::from("~"));
     }
     if let Some(rest) = path.strip_prefix("~/")
-        && let Some(home) = std::env::var_os("HOME")
+        && let Some(home) = home_dir()
     {
-        return PathBuf::from(home).join(rest);
+        return home.join(rest);
     }
     PathBuf::from(path)
 }
@@ -265,18 +452,66 @@ pub fn common_prefix(candidates: &[CompletionCandidate]) -> String {
     };
     let mut prefix = first.value.clone();
     for c in candidates.iter().skip(1) {
+        // bytes are fine for comparing, but cutting the prefix has to land on
+        // a char boundary or rust will panic on perfectly valid unicode paths.
         let limit = prefix.len().min(c.value.len());
-        let mut i = 0;
-        while i < limit {
-            let (a, b) = (prefix.as_bytes()[i], c.value.as_bytes()[i]);
-            if a != b {
+        let mut end = 0;
+        for i in 0..limit {
+            if prefix.as_bytes()[i] != c.value.as_bytes()[i] {
                 break;
             }
-            i += 1;
+            end = i + 1;
         }
-        prefix.truncate(i);
+        while !prefix.is_char_boundary(end) {
+            end -= 1;
+        }
+        prefix.truncate(end);
     }
     prefix
+}
+
+/// strip terminal control sequences from untrusted text. whisper output,
+/// remote titles and filenames all end up on screen; an escape sequence in any
+/// of them can repaint the ui or, on a permissive terminal, do worse. newlines
+/// and tabs are kept because transcripts legitimately contain them.
+pub fn sanitize_terminal(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\n' | '\t' => out.push(ch),
+            '\u{1b}' => {
+                // swallow escape parameters (0x20..0x3f) then the final byte.
+                // '[31m' is three bytes; stopping at '[' would leave '31m'
+                // painted into the transcript, which is not much better.
+                match chars.next() {
+                    Some(']') => {
+                        for tail in chars.by_ref() {
+                            if tail == '\u{7}' {
+                                break;
+                            }
+                            if tail == '\u{1b}' {
+                                let _ = chars.next();
+                                break;
+                            }
+                        }
+                    }
+                    Some(_) => {
+                        for next in chars.by_ref() {
+                            if (0x20..=0x3f).contains(&(next as u32)) {
+                                continue;
+                            }
+                            break;
+                        }
+                    }
+                    None => {}
+                }
+            }
+            c if (c as u32) < 0x20 || (0x7f..=0x9f).contains(&(c as u32)) => {}
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// wrap to a cell width without splitting wide glyphs. a single word longer
@@ -445,6 +680,27 @@ mod tests {
         assert!(!is_url("ftp://example.com/a"));
         assert!(!is_url("file:///tmp/a.wav"));
         assert!(!is_url("not a url"));
+        assert!(!is_url("https:///no-host"));
+        assert!(!is_url("http:// "));
+        assert!(is_url("https://example.com/a?b=c#d"));
+        assert!(is_url("http://user:pass@example.com:8080/a"));
+    }
+
+    #[test]
+    fn youtube_hosts_are_matched_as_hosts() {
+        assert!(!is_youtube_url(
+            "https://notyoutube.com.evil.test/watch?v=x"
+        ));
+        assert!(!youtube_id("https://notyoutube.com.evil.test/watch?v=x").is_some());
+        assert!(is_youtube_url("https://www.youtube.com/watch?v=abc"));
+        assert_eq!(
+            youtube_id("https://www.youtube.com/watch?v=abc"),
+            Some("abc".into())
+        );
+        assert_eq!(
+            youtube_id("https://youtube.com/embed/xyz?start=1"),
+            Some("xyz".into())
+        );
     }
 
     #[test]
@@ -486,6 +742,74 @@ mod tests {
         ];
         assert_eq!(common_prefix(&list), "fooba");
         assert_eq!(common_prefix(&[]), "");
+    }
+
+    #[test]
+    fn user_directories_are_platform_shaped() {
+        let cache = cache_home();
+        let config = config_home();
+        assert!(!cache.as_os_str().is_empty());
+        assert!(!config.as_os_str().is_empty());
+        if cfg!(target_os = "macos") && home_dir().is_some() {
+            assert!(cache.ends_with("Caches"));
+            assert!(config.ends_with("Application Support"));
+        }
+        if cfg!(windows) && std::env::var_os("LOCALAPPDATA").is_none() && home_dir().is_some() {
+            assert!(cache.ends_with(".cache"));
+        }
+    }
+
+    #[test]
+    fn terminal_text_is_sanitized() {
+        let evil = "hello\x1b[31mred\x1b[0m\x07\x00world\nnext\tcol";
+        let clean = sanitize_terminal(evil);
+        assert!(!clean.contains('\u{1b}'));
+        assert!(!clean.contains('\u{7}'));
+        assert!(!clean.contains('\u{0}'));
+        assert!(clean.contains("hellored"));
+        assert!(clean.contains("world\nnext\tcol"));
+        assert_eq!(sanitize_terminal("你好 世界"), "你好 世界");
+    }
+
+    #[test]
+    fn shared_prefix_never_cuts_a_utf8_character() {
+        use super::CompletionCandidate as C;
+        let list = vec![
+            C {
+                value: "会议记录.wav".into(),
+                label: "a".into(),
+                dir: "".into(),
+                is_dir: false,
+                score: 0,
+            },
+            C {
+                value: "会议纪要.wav".into(),
+                label: "b".into(),
+                dir: "".into(),
+                is_dir: false,
+                score: 0,
+            },
+        ];
+        let shared = common_prefix(&list);
+        assert!(std::str::from_utf8(shared.as_bytes()).is_ok());
+        assert_eq!(shared, "会议");
+        let mixed = vec![
+            C {
+                value: "éclair".into(),
+                label: "a".into(),
+                dir: "".into(),
+                is_dir: false,
+                score: 0,
+            },
+            C {
+                value: "école".into(),
+                label: "b".into(),
+                dir: "".into(),
+                is_dir: false,
+                score: 0,
+            },
+        ];
+        assert_eq!(common_prefix(&mixed), "éc");
     }
 
     #[test]
