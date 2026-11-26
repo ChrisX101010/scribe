@@ -665,24 +665,36 @@ pub fn partial_size(info: &ModelInfo) -> Option<u64> {
 }
 
 pub fn remove_partial(info: &ModelInfo) -> Result<(), String> {
-    let path = cache_dir().join(format!("{}.part", info.file));
-    match fs::remove_file(&path) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(format!(
-            "cannot remove partial model {}: {e}",
-            path.display()
-        )),
-    }
+    let dir = cache_dir();
+    remove_cached_files(&dir, info.file, [dir.join(format!("{}.part", info.file))])
 }
 
 pub fn remove_model(info: &ModelInfo) -> Result<(), String> {
     let dir = cache_dir();
-    for path in [
-        dir.join(info.file),
-        dir.join(format!("{}.part", info.file)),
-        dir.join(format!(".{}.error", info.file)),
-    ] {
+    remove_cached_files(
+        &dir,
+        info.file,
+        [
+            dir.join(info.file),
+            dir.join(format!("{}.part", info.file)),
+            dir.join(format!(".{}.error", info.file)),
+        ],
+    )
+}
+
+fn remove_cached_files(
+    dir: &Path,
+    file: &str,
+    paths: impl IntoIterator<Item = PathBuf>,
+) -> Result<(), String> {
+    if !dir
+        .try_exists()
+        .map_err(|e| format!("cannot inspect model directory: {e}"))?
+    {
+        return Ok(());
+    }
+    let _lock = DownloadLock::acquire(dir, file)?;
+    for path in paths {
         match fs::remove_file(&path) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -692,49 +704,28 @@ pub fn remove_model(info: &ModelInfo) -> Result<(), String> {
     Ok(())
 }
 
-/// one process at a time may touch a given partial file. without this, two
-/// scribes can append to the same `.part` and each verify the other's debris.
+/// downloading and removing a model both take this lock. the lock file stays
+/// in place so every process opens the same file. closing it releases the lock.
 #[derive(Debug)]
-struct DownloadLock(PathBuf);
+struct DownloadLock {
+    _file: fs::File,
+}
 
 impl DownloadLock {
     fn acquire(dir: &Path, file: &str) -> Result<Self, String> {
-        let path = dir.join(format!(".{file}.lock"));
-        match fs::OpenOptions::new()
+        let lock = fs::OpenOptions::new()
             .write(true)
-            .create_new(true)
-            .open(&path)
-        {
-            Ok(_) => Ok(Self(path)),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                let stale = fs::metadata(&path)
-                    .and_then(|m| m.modified())
-                    .map(|t| t.elapsed().unwrap_or_default() > std::time::Duration::from_secs(600))
-                    .unwrap_or(true);
-                if stale {
-                    let _ = fs::remove_file(&path);
-                    if fs::OpenOptions::new()
-                        .write(true)
-                        .create_new(true)
-                        .open(&path)
-                        .is_ok()
-                    {
-                        return Ok(Self(path));
-                    }
-                }
-                Err(format!(
-                    "another scribe is downloading {file}. wait for it to finish (or remove the stale lock at {})",
-                    path.display()
-                ))
-            }
-            Err(e) => Err(format!("cannot create download lock: {e}")),
+            .create(true)
+            .truncate(false)
+            .open(dir.join(format!(".{file}.cache.lock")))
+            .map_err(|e| format!("cannot open model cache lock: {e}"))?;
+        match lock.try_lock() {
+            Ok(()) => Ok(Self { _file: lock }),
+            Err(fs::TryLockError::WouldBlock) => Err(format!(
+                "another scribe is using the model cache for {file}"
+            )),
+            Err(fs::TryLockError::Error(e)) => Err(format!("cannot lock model cache: {e}")),
         }
-    }
-}
-
-impl Drop for DownloadLock {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.0);
     }
 }
 
@@ -1246,6 +1237,36 @@ mod tests {
         assert!(second.unwrap_err().contains("another scribe"));
         drop(first);
         assert!(DownloadLock::acquire(&dir, "ggml-test.bin").is_ok());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn cache_removal_respects_the_download_lock() {
+        let dir = std::env::temp_dir().join(format!("scribe-lock-removal-{}", std::process::id()));
+        let file = "ggml-test.bin";
+        let model = dir.join(file);
+        let partial = dir.join(format!("{file}.part"));
+        assert!(remove_cached_files(&dir, file, [partial.clone()]).is_ok());
+        assert!(!dir.exists());
+
+        fs::create_dir(&dir).unwrap();
+        fs::write(&model, b"model").unwrap();
+        fs::write(&partial, b"partial").unwrap();
+        let lock = DownloadLock::acquire(&dir, file).unwrap();
+
+        for paths in [vec![partial.clone()], vec![model.clone(), partial.clone()]] {
+            let err = remove_cached_files(&dir, file, paths).unwrap_err();
+            assert!(err.contains("another scribe"));
+        }
+        assert_eq!(fs::read(&model).unwrap(), b"model");
+        assert_eq!(fs::read(&partial).unwrap(), b"partial");
+
+        drop(lock);
+        remove_cached_files(&dir, file, [partial.clone()]).unwrap();
+        assert!(!partial.exists());
+        assert!(model.exists());
+        remove_cached_files(&dir, file, [model.clone(), partial]).unwrap();
+        assert!(!model.exists());
         fs::remove_dir_all(&dir).unwrap();
     }
 
