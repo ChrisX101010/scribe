@@ -200,6 +200,22 @@ fn install_panic_hook() {
     }));
 }
 
+fn collect_plain_segments(
+    events: impl IntoIterator<Item = WorkerEventKind>,
+) -> Result<Vec<export::Segment>, String> {
+    let mut segments = Vec::new();
+    for event in events {
+        match event {
+            WorkerEventKind::Segment(segment) => segments.push(segment),
+            WorkerEventKind::Done => return Ok(segments),
+            WorkerEventKind::Cancelled => return Err("transcription cancelled".into()),
+            WorkerEventKind::Error(error) => return Err(error),
+            _ => {}
+        }
+    }
+    Err("transcription ended before the worker reported completion".into())
+}
+
 fn run_plain(args: &Args) -> Result<String, String> {
     let source = args.input.as_ref().ok_or("give me a file path or a url")?;
     let need = util::is_url(source);
@@ -220,23 +236,10 @@ fn run_plain(args: &Args) -> Result<String, String> {
     };
     let (tx, rx) = mpsc::channel();
     let handle = worker::spawn(job, tx, worker::next_job_id());
-    let mut segments = Vec::new();
-    let mut failure = None;
-    for event in rx {
-        match event.kind {
-            WorkerEventKind::Segment(s) => segments.push(s),
-            WorkerEventKind::Error(e) => {
-                failure = Some(e);
-                break;
-            }
-            _ => {}
-        }
-    }
+    let result = collect_plain_segments(rx.into_iter().map(|event| event.kind));
     // the worker may still be unwinding after its last event. stop joins it.
     handle.stop();
-    if let Some(e) = failure {
-        return Err(e);
-    }
+    let segments = result?;
     let output = export::export(args.format, &segments, Some(source));
     if let Some(dir) = &args.out {
         std::fs::create_dir_all(dir)
@@ -1065,6 +1068,34 @@ use util::{duration_short, human_bytes, timestamp_short};
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plain_transcription_requires_worker_completion() {
+        let segment = || export::Segment::new(0, 100, "hello".into());
+
+        let incomplete = collect_plain_segments([WorkerEventKind::Segment(segment())]);
+        assert_eq!(
+            incomplete.unwrap_err(),
+            "transcription ended before the worker reported completion"
+        );
+
+        let complete =
+            collect_plain_segments([WorkerEventKind::Segment(segment()), WorkerEventKind::Done])
+                .unwrap();
+        assert_eq!(complete.len(), 1);
+        assert_eq!(complete[0].text, "hello");
+        let empty = collect_plain_segments([WorkerEventKind::Done]).unwrap();
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn plain_transcription_reports_worker_failure_and_cancellation() {
+        let cancelled = collect_plain_segments([WorkerEventKind::Cancelled]);
+        assert_eq!(cancelled.unwrap_err(), "transcription cancelled");
+
+        let failed = collect_plain_segments([WorkerEventKind::Error("decoder failed".into())]);
+        assert_eq!(failed.unwrap_err(), "decoder failed");
+    }
 
     #[test]
     fn terminal_cleanup_continues_after_a_failed_step() {
