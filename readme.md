@@ -27,7 +27,8 @@
   <a href="#features">features</a> ·
   <a href="#keybindings">keybindings</a> ·
   <a href="#models">models</a> ·
-  <a href="#privacy">privacy</a>
+  <a href="#privacy">privacy</a> ·
+  <a href="#sponsor">sponsor</a>
 </p>
 
 <p align="center">
@@ -49,6 +50,27 @@ no account. no GPU. no subscription. no telemetry.
 - **built for terminal use.** a responsive Ratatui interface, keyboard-first controls and 22 themes.
 - **useful output.** export subtitles, notes or structured JSON with timestamps.
 - **scriptable.** `--no-tui` writes the transcript to stdout.
+
+
+## sponsor
+
+<p align="center">
+  <strong>help keep scribe independent.</strong>
+  <br>
+  if scribe makes your workflow a little better, consider supporting its continued development.
+  <br>
+  your support helps make room for maintenance, testing, better documentation and thoughtful improvements.
+</p>
+
+<p align="center">
+  <a href="https://github.com/sponsors/programmersd21">
+    <img src="https://img.shields.io/badge/sponsor_on_github-support_scribe-ea4aaa?style=for-the-badge&logo=githubsponsors&logoColor=white" alt="sponsor scribe on GitHub">
+  </a>
+</p>
+
+<p align="center">
+  sponsorship is completely optional. using scribe, sharing it, reporting bugs and contributing code are just as appreciated.
+</p>
 
 ## install
 
