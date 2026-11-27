@@ -412,7 +412,16 @@ pub fn find(key: &str) -> Option<&'static ModelInfo> {
 /// where models live. xdg if you have it, ~/.cache if you do not. i am not
 /// going to guess three more conventions and make a mess of your home dir.
 pub fn cache_dir() -> PathBuf {
+    #[cfg(test)]
+    if let Some(dir) = TEST_CACHE_DIR.with(|dir| dir.borrow().clone()) {
+        return dir;
+    }
     crate::util::cache_home().join("scribe").join("models")
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_CACHE_DIR: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
 }
 
 /// What a `--model`/saved value can refer to. Keeping the three forms distinct
@@ -687,12 +696,6 @@ fn remove_cached_files(
     file: &str,
     paths: impl IntoIterator<Item = PathBuf>,
 ) -> Result<(), String> {
-    if !dir
-        .try_exists()
-        .map_err(|e| format!("cannot inspect model directory: {e}"))?
-    {
-        return Ok(());
-    }
     let _lock = DownloadLock::acquire(dir, file)?;
     for path in paths {
         match fs::remove_file(&path) {
@@ -704,29 +707,87 @@ fn remove_cached_files(
     Ok(())
 }
 
-/// downloading and removing a model both take this lock. the lock file stays
-/// in place so every process opens the same file. closing it releases the lock.
+/// The persistent file serializes current processes. The legacy path uses a
+/// directory so older downloaders cannot unlink it as a stale lock file.
 #[derive(Debug)]
 struct DownloadLock {
+    legacy_marker: PathBuf,
     _file: fs::File,
 }
 
 impl DownloadLock {
     fn acquire(dir: &Path, file: &str) -> Result<Self, String> {
-        let lock = fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(dir.join(format!(".{file}.cache.lock")))
+        fs::create_dir_all(dir).map_err(|e| format!("cannot create model directory: {e}"))?;
+        let lock = open_cache_lock(&dir.join(format!(".{file}.cache.lock")))
             .map_err(|e| format!("cannot open model cache lock: {e}"))?;
-        match lock.try_lock() {
-            Ok(()) => Ok(Self { _file: lock }),
-            Err(fs::TryLockError::WouldBlock) => Err(format!(
-                "another scribe is using the model cache for {file}"
-            )),
-            Err(fs::TryLockError::Error(e)) => Err(format!("cannot lock model cache: {e}")),
+        if !lock
+            .metadata()
+            .map_err(|e| format!("cannot inspect model cache lock: {e}"))?
+            .is_file()
+        {
+            return Err("model cache lock is not a regular file".into());
         }
+        match lock.try_lock() {
+            Ok(()) => {}
+            Err(fs::TryLockError::WouldBlock) => {
+                return Err(format!(
+                    "another scribe is using the model cache for {file}"
+                ));
+            }
+            Err(fs::TryLockError::Error(e)) => return Err(format!("cannot lock model cache: {e}")),
+        }
+
+        let legacy_marker = dir.join(format!(".{file}.lock"));
+        match fs::create_dir(&legacy_marker) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                // Only versions that take the OS lock create this directory.
+                // If it survived a crash, the OS lock lets us adopt it safely.
+                let is_directory =
+                    fs::symlink_metadata(&legacy_marker).is_ok_and(|metadata| metadata.is_dir());
+                if !is_directory {
+                    return Err(format!(
+                        "another scribe is using the model cache for {file} (legacy lock at {})",
+                        legacy_marker.display()
+                    ));
+                }
+            }
+            Err(e) => return Err(format!("cannot create legacy model cache marker: {e}")),
+        }
+        Ok(Self {
+            legacy_marker,
+            _file: lock,
+        })
     }
+}
+
+impl Drop for DownloadLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir(&self.legacy_marker);
+    }
+}
+
+#[cfg(unix)]
+fn open_cache_lock(path: &Path) -> std::io::Result<File> {
+    use rustix::fs::{Mode, OFlags, open};
+
+    let flags =
+        OFlags::RDWR | OFlags::CREATE | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    Ok(open(path, flags, Mode::RUSR | Mode::WUSR).map(File::from)?)
+}
+
+#[cfg(windows)]
+fn open_cache_lock(path: &Path) -> std::io::Result<File> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x00200000;
+    fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
 }
 
 /// download to a .part file, verify size and sha256, then rename. the rename is
@@ -748,7 +809,6 @@ fn download_from(
     cancel: &std::sync::Arc<std::sync::atomic::AtomicBool>,
     on_progress: impl Fn(DownloadProgress),
 ) -> Result<PathBuf, String> {
-    fs::create_dir_all(&dir).map_err(|e| format!("cannot create model directory: {e}"))?;
     let _lock = DownloadLock::acquire(&dir, info.file)?;
     let final_path = dir.join(info.file);
     let part = dir.join(format!("{}.part", info.file));
@@ -1241,32 +1301,80 @@ mod tests {
     }
 
     #[test]
-    fn cache_removal_respects_the_download_lock() {
+    fn public_cache_removals_respect_the_download_lock() {
         let dir = std::env::temp_dir().join(format!("scribe-lock-removal-{}", std::process::id()));
-        let file = "ggml-test.bin";
-        let model = dir.join(file);
-        let partial = dir.join(format!("{file}.part"));
-        assert!(remove_cached_files(&dir, file, [partial.clone()]).is_ok());
-        assert!(!dir.exists());
+        let info = tiny_info("unused");
+        let model = dir.join(info.file);
+        let partial = dir.join(format!("{}.part", info.file));
+        let error = dir.join(format!(".{}.error", info.file));
+        TEST_CACHE_DIR.with(|cache| *cache.borrow_mut() = Some(dir.clone()));
 
-        fs::create_dir(&dir).unwrap();
+        assert!(!dir.exists());
+        remove_partial(&info).unwrap();
+        assert!(dir.join(format!(".{}.cache.lock", info.file)).is_file());
+
         fs::write(&model, b"model").unwrap();
         fs::write(&partial, b"partial").unwrap();
-        let lock = DownloadLock::acquire(&dir, file).unwrap();
+        fs::write(&error, b"old note").unwrap();
+        let lock = DownloadLock::acquire(&dir, info.file).unwrap();
 
-        for paths in [vec![partial.clone()], vec![model.clone(), partial.clone()]] {
-            let err = remove_cached_files(&dir, file, paths).unwrap_err();
-            assert!(err.contains("another scribe"));
-        }
+        assert!(
+            remove_partial(&info)
+                .unwrap_err()
+                .contains("another scribe")
+        );
+        assert!(remove_model(&info).unwrap_err().contains("another scribe"));
         assert_eq!(fs::read(&model).unwrap(), b"model");
         assert_eq!(fs::read(&partial).unwrap(), b"partial");
+        assert_eq!(fs::read(&error).unwrap(), b"old note");
 
         drop(lock);
-        remove_cached_files(&dir, file, [partial.clone()]).unwrap();
+        remove_partial(&info).unwrap();
         assert!(!partial.exists());
         assert!(model.exists());
-        remove_cached_files(&dir, file, [model.clone(), partial]).unwrap();
+        assert!(error.exists());
+        remove_model(&info).unwrap();
         assert!(!model.exists());
+        assert!(!error.exists());
+        TEST_CACHE_DIR.with(|cache| *cache.borrow_mut() = None);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn legacy_downloads_contend_and_cannot_remove_the_marker() {
+        let dir = std::env::temp_dir().join(format!("scribe-legacy-lock-{}", std::process::id()));
+        fs::create_dir(&dir).unwrap();
+        let file = "ggml-test.bin";
+        let legacy = dir.join(format!(".{file}.lock"));
+        File::create_new(&legacy).unwrap();
+        assert!(
+            DownloadLock::acquire(&dir, file)
+                .unwrap_err()
+                .contains("legacy lock")
+        );
+        fs::remove_file(&legacy).unwrap();
+
+        // A previous new-version process could have exited before dropping the marker.
+        fs::create_dir(&legacy).unwrap();
+        let lock = DownloadLock::acquire(&dir, file).unwrap();
+        assert!(File::create_new(&legacy).is_err());
+        assert!(fs::remove_file(&legacy).is_err());
+        assert!(legacy.is_dir());
+        drop(lock);
+
+        File::create_new(&legacy).unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn cache_lock_rejects_a_directory() {
+        let dir = std::env::temp_dir().join(format!("scribe-nonfile-lock-{}", std::process::id()));
+        let file = "ggml-test.bin";
+        let lock_path = dir.join(format!(".{file}.cache.lock"));
+        fs::create_dir_all(&lock_path).unwrap();
+        assert!(DownloadLock::acquire(&dir, file).is_err());
+        assert!(lock_path.is_dir());
+        assert!(!dir.join(format!(".{file}.lock")).exists());
         fs::remove_dir_all(&dir).unwrap();
     }
 
