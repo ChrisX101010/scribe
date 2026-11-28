@@ -1,6 +1,14 @@
-# scribe
+<h1 align="center">scribe</h1>
 
-![demo](assets/demo.png)
+<p align="center">
+  <strong>private speech-to-text, right in your terminal.</strong>
+  <br>
+  local inference · cpu-only · word-level timing · five export formats
+</p>
+
+<p align="center">
+  <img src="assets/demo.png" alt="scribe terminal interface showing a live transcription" width="900">
+</p>
 
 <p align="center">
   <img src="https://img.shields.io/badge/rust-2024-cba6f7?style=for-the-badge&logo=rust&logoColor=white&labelColor=313244" alt="rust 2024">
@@ -13,299 +21,423 @@
   <img src="https://img.shields.io/badge/license-mit-f5e0dc?style=for-the-badge&logo=opensourceinitiative&logoColor=white&labelColor=313244" alt="mit license">
 </p>
 
-speech to text in the terminal. point it at a file or a url, get a timestamped
-transcript while the audio is still playing, press `e` when you want it out.
-runs locally on your cpu. no cloud, no account, no telemetry, no electron.
+<p align="center">
+  <a href="#install">install</a> ·
+  <a href="#quick-start">quick start</a> ·
+  <a href="#features">features</a> ·
+  <a href="#keybindings">keybindings</a> ·
+  <a href="#models">models</a> ·
+  <a href="#privacy">privacy</a> ·
+  <a href="#sponsor">sponsor</a>
+</p>
+
+<p align="center">
+  <a href="https://github.com/programmersd21/scribe/releases/latest">releases</a> ·
+  <a href="https://crates.io/crates/scribe-tui">crates.io</a> ·
+  <a href="https://aur.archlinux.org/packages/scribe-tui-bin">arch user repository</a>
+</p>
+
+---
+
+scribe turns audio into timestamped text without sending recordings to a hosted transcription service. give it a local file or a supported URL, watch transcript segments arrive, then search, copy and export from a terminal interface.
+
+no account. no GPU. no subscription. no telemetry.
+
+## why scribe
+
+- **private by design.** inference runs locally through whisper.cpp.
+- **no GPU requirement.** CPU-only builds keep installation straightforward.
+- **built for terminal use.** a responsive Ratatui interface, keyboard-first controls and 22 themes.
+- **useful output.** export subtitles, notes or structured JSON with timestamps.
+- **scriptable.** `--no-tui` writes the transcript to stdout.
+
+
+## sponsor
+
+<p align="center">
+  <strong>help keep scribe independent.</strong>
+  <br>
+  if scribe makes your workflow a little better, consider supporting its continued development.
+  <br>
+  your support helps make room for maintenance, testing, better documentation and thoughtful improvements.
+</p>
+
+<p align="center">
+  <a href="https://github.com/sponsors/programmersd21">
+    <img src="https://img.shields.io/badge/sponsor_on_github-support_scribe-ea4aaa?style=for-the-badge&logo=githubsponsors&logoColor=white" alt="sponsor scribe on GitHub">
+  </a>
+</p>
+
+<p align="center">
+  sponsorship is completely optional. using scribe, sharing it, reporting bugs and contributing code are just as appreciated.
+</p>
 
 ## install
 
-the crates.io name is `scribe-tui` because somebody else got plain `scribe`
-first. the binary is still `scribe`, which is the part you actually type.
+### cargo
+
+requires Rust 1.90 or later, plus the native build prerequisites below.
 
 ```sh
 cargo install scribe-tui
 ```
 
-from a checkout:
+the package is called `scribe-tui` because the `scribe` crate name was already taken. the installed executable is `scribe`.
+
+### arch linux
 
 ```sh
-cargo build --release
-./target/release/scribe
+paru -S scribe-tui-bin
 ```
 
-prebuilt cpu binaries land on the releases page for linux, macos and windows
-when we cut a tag.
+### prebuilt binaries
 
-## setup, or the lack of it
+download the latest release:
 
-nothing to install by hand. on first url use, the `yt-dlp` crate fetches its own
-yt-dlp and ffmpeg binaries into `~/.cache/scribe/bin/yt-dlp-2` (or under
-`$XDG_CACHE_HOME`). local files use the ffmpeg on your `PATH`, falling back to
-the managed copy if you have none.
+**[get the latest release](https://github.com/programmersd21/scribe/releases/latest)**
 
-models live in the platform cache (`~/.cache/scribe/models` on linux,
-`~/Library/Caches/scribe/models` on macos, `%LOCALAPPDATA%\scribe\models` on
-windows, or under `$XDG_CACHE_HOME`). press `m` in the tui to pick one and it
-downloads itself from hugging face. start with `small-q5_1`. downloads are
-checked against the upstream sha-256 before they are accepted; a bad file gets
-deleted and retried. a per-model lock keeps two scribe processes from appending
-to the same partial file.
+| platform | release asset |
+|:--|:--|
+| linux x86_64 | `scribe-linux-x86_64` |
+| macOS arm64 | `scribe-macos-aarch64` |
+| windows x86_64 | `scribe-windows-x86_64.exe` |
 
-every catalog model is verified against its catalog size and sha-256 before it
-reaches whisper, whether it came from the picker, `--model`, a saved preference
-or the default lookup. a corrupt cache file is rejected with instructions to
-re-download it; a different intact cached model still works. custom ggml paths
-are checked for a plausible size and ggml/gguf header, but there is no catalog
-checksum to compare them against.
+each release includes `SHA256SUMS` for verifying downloaded binaries.
 
-settings made in the tui persist in the platform config directory (for example
-`~/.config/scribe/config` or `$XDG_CONFIG_HOME/scribe/config`). command-line
-options win over saved values. `--help` and error output borrow their colors
-from your saved theme when stdout is a terminal. `NO_COLOR` and `TERM=dumb` turn
-that off.
+### build prerequisites
 
-run `scribe --doctor` for a read-only report on ffmpeg, yt-dlp, model integrity,
-paths and permissions. it installs nothing and writes nothing.
+| requirement | when it is needed |
+|:--|:--|
+| Rust 1.90 or later | building from source |
+| C/C++ compiler, CMake and libclang | compiling whisper-rs |
+| FFmpeg | decoding local audio and video |
+| network access | first model download and URL input |
 
-## usage
+Debian / Ubuntu:
 
 ```sh
-scribe                            # just open it
-scribe meeting.wav                # preload a file
-scribe https://youtu.be/...       # preload a url
-scribe a.wav --model base-q5_1    # pick a model by name
-scribe a.wav --threads 4          # cap cpu threads
-scribe a.wav --format srt         # export format
-scribe a.wav --lang de            # language hint
-scribe a.wav --translate          # translate to english
-scribe a.wav --no-tui             # plain transcript to stdout, for scripts
-scribe --doctor                   # read-only installation check
-scribe --help
-scribe --version
+sudo apt-get install clang libclang-dev cmake pkg-config ffmpeg
 ```
 
-language codes are validated against whisper's own language table before
-inference. `auto` lets the model detect the language; an english-only model
-forces english regardless of the hint. the settings panel cycles through the
-supported languages with human-readable names.
+macOS requires Xcode command line tools and CMake. Windows requires the MSVC build tools and CMake.
 
-`--no-tui` writes the transcript to stdout and keeps whisper's chatter on
-stderr, so `scribe audio.wav --no-tui > out.txt` does what you expect.
+for URL input, scribe can download and manage its own yt-dlp and FFmpeg binaries in its cache. local files use FFmpeg available on your system.
 
-## keybinds
+## quick start
+
+launch the interface:
+
+```sh
+scribe
+```
+
+or pass a source directly:
+
+```sh
+scribe meeting.wav
+scribe https://youtu.be/...
+```
+
+choose a model, set a language if you know it, and start transcription.
+
+### useful commands
+
+```sh
+scribe lecture.wav --model small-q5_1 --lang en
+scribe interview.mp4 --format srt
+scribe recording.wav --format md --out ./notes
+scribe https://youtu.be/... --format vtt
+scribe lecture.wav --no-tui > lecture.txt
+scribe --doctor
+```
+
+### command-line reference
+
+| option | purpose |
+|:--|:--|
+| `--model <name-or-path>` | choose a catalog model or local model file |
+| `--threads <n>` | set CPU thread count; default is up to 8 |
+| `--lang <code>` | set a language hint; use `auto` for detection |
+| `--translate` | translate recognized speech to English |
+| `--out <dir>` | choose the export directory |
+| `--format <fmt>` | choose `txt`, `srt`, `vtt`, `md` or `json` |
+| `--theme <name>` | choose the startup theme |
+| `--no-tui` | run without the terminal interface and print text to stdout |
+| `--doctor` | run a read-only installation check |
+| `--help` | show all options |
+| `--version` | print the installed version |
+
+`--no-tui` is useful in shell scripts and pipelines. transcript text goes to stdout; diagnostics go to stderr.
+
+```sh
+scribe meeting.wav --no-tui > meeting.txt
+scribe meeting.wav --no-tui --format json > meeting.json
+```
+
+## how it works
+
+```mermaid
+flowchart TD
+    A["audio file or URL"] --> B{"source type"}
+    B -->|"URL"| C["yt-dlp fetch"]
+    B -->|"local file"| D["FFmpeg decode"]
+    C --> D
+    D --> E["16 kHz mono audio"]
+    E --> F["whisper.cpp on CPU"]
+    F --> G["timestamped transcript segments"]
+    G --> H["TUI, stdout or export"]
+```
+
+URL fetching is an input step. transcription itself happens on your machine.
+
+## features
+
+| capability | details |
+|:--|:--|
+| live transcription | transcript segments arrive while audio is processed |
+| word timing | retain Whisper token timing when available |
+| local inference | whisper.cpp through whisper-rs, CPU-only |
+| file and URL input | local audio/video or supported URLs |
+| model manager | browse, download, pause, resume and remove cached models |
+| pause and resume | pause between decode windows and continue from the last committed position |
+| partial results | stop a job and keep the transcript already captured |
+| five export formats | TXT, SRT, VTT, Markdown and JSON |
+| 22 themes | preview and switch palettes at runtime |
+| transcript search | find text and navigate between matches |
+| path completion | fuzzy-ranked suggestions in the source field |
+| diagnostics | inspect dependencies, model integrity, paths and permissions |
+| script mode | send plain transcript output to stdout |
+
+## keybindings
+
+### main interface
 
 | key | action |
-| --- | --- |
-| enter | start, confirm, accept a completion, or resume when paused |
-| tab | switch focus; fill the shared prefix or accept a path completion |
-| up / down | move selection, or move through completion suggestions |
-| right | accept the highlighted completion |
-| ctrl+space | force the completion list open |
-| esc / space / p | pause the active job; press again to resume (`space` works in the transcript pane) |
-| c | stop the active job, keeping the segments already captured |
-| / | live search |
-| n / N | next / previous match |
-| j / k | move selection |
-| page up / page down | scroll ten rows |
-| esc | dismiss completion, clear search, or go back |
-| e | export menu |
-| y | copy selected segment (osc 52, works over ssh) |
-| m | model picker |
-| s | settings |
-| t | theme palette (live preview) |
-| ? | help |
-| ctrl+c | quit |
+|:--|:--|
+| `enter` | start, confirm, accept a completion or resume |
+| `tab` | switch focus or complete a path |
+| `up` / `down` | move through selections and suggestions |
+| `right` | accept the highlighted completion |
+| `ctrl+space` | open the completion list |
+| `esc` / `space` / `p` | pause an active job |
+| `c` | stop the active job and keep captured segments |
+| `/` | search the transcript |
+| `n` / `N` | next / previous match |
+| `j` / `k` | move selection |
+| `page up` / `page down` | scroll ten rows |
+| `e` | open export menu |
+| `y` | copy the selected segment |
+| `m` | open model picker |
+| `s` | open settings |
+| `t` | open theme palette |
+| `?` | show help |
+| `ctrl+c` | quit |
 
-the first `esc` pauses an active transcription, not kills it. `enter`, `space`
-or `p` picks it back up at the same audio position. nothing restarts from zero.
-a second `esc`, or `c`, stops it for good and leaves the partial transcript in
-place so you can still export it.
+the first `esc` pauses an active transcription. use `enter`, `space` or `p` to resume. a second `esc`, or `c`, stops the job and keeps the partial transcript available for export.
 
-inside the **source field**, path completion behaves like you would expect from
-an editor: fuzzy rank, inline ghost text, a suggestion list you can navigate,
-shared-prefix fill on the first `tab`, and a full commit on the second.
-
-inside the **model picker**:
+### model picker
 
 | key | action |
-| --- | --- |
-| enter | activate a ready model, or start / resume a download |
-| p | pause the active download (partial data is kept) |
-| c | cancel the active download and delete its partial file |
-| x | remove a cached model |
-| j / k or up / down | move through the table |
-| page up / page down | jump ten rows |
-| home / end | jump to the first or last row |
-| esc | pause a download, or close |
+|:--|:--|
+| `enter` | activate a ready model or start / resume its download |
+| `p` | pause the active download |
+| `c` | cancel the download and remove its partial file |
+| `x` | remove a cached model |
+| `j` / `k`, `up` / `down` | move through the model list |
+| `page up` / `page down` | move ten rows |
+| `home` / `end` | jump to the first / last row |
+| `esc` | pause a download or close the picker |
 
-inside the **theme picker**, `j / k` or the arrow keys cycle with a live preview.
-`enter` confirms; `esc` reverts the preview and closes.
+### theme picker
 
-## themes
-
-22 palettes, switchable at runtime with `t`. the full set:
-
-catppuccin mocha, catppuccin macchiato, catppuccin frappe, catppuccin latte,
-tokyo night, tokyo night storm, nord, dracula, gruvbox dark, one dark,
-solarized dark, solarized light, github dark, github light, everforest,
-kanagawa, rose pine, rose pine dawn, material dark, palenight, cyberpunk,
-high contrast.
-
-`--theme <name>` sets the startup theme. aliases are accepted (`dark`, `light`,
-`contrast`, `nord`, `tokyo-night`, `rose-pine-dawn`, and so on). unknown names
-fall back to catppuccin mocha rather than making a scene.
+use `j` / `k` or the arrow keys to preview palettes. press `enter` to keep a theme or `esc` to revert.
 
 ## models
 
-the picker carries all 33 pre-converted ggml models from the upstream
-`ggerganov/whisper.cpp` repository, including quantized `q5`/`q8` builds and
-english-only `.en` variants. the default is `small-q5_1`; `large-v3-turbo-q5_0`
-is the quality pick. shas come from hugging face file metadata; the upstream
-readme table is stale and we do not trust it.
+the model picker includes 33 pre-converted GGML models from the [whisper.cpp model collection](https://huggingface.co/ggerganov/whisper.cpp), including quantized q5 and q8 variants and English-only models.
 
-| name | disk | approx ram | speed |
-| --- | --- | --- | --- |
-| tiny / tiny.en | 75 MiB | 120 MiB | fastest |
-| tiny-q5_1 / tiny.en-q5_1 | 31 MiB | 120 MiB | fastest |
-| tiny-q8_0 / tiny.en-q8_0 | 42 MiB | 200 MiB | fastest |
-| base / base.en | 142 MiB | 500 MiB | fast |
-| base-q5_1 / base.en-q5_1 | 57 MiB | 200 MiB | fast |
-| base-q8_0 / base.en-q8_0 | 78 MiB | 200 MiB | fast |
-| small / small.en | 466 MiB | 1200 MiB | balanced |
-| small-q5_1 / small.en-q5_1 | 181 MiB | 500 MiB | balanced |
-| small-q8_0 / small.en-q8_0 | 252 MiB | 650 MiB | balanced |
-| medium / medium.en | 1.5 GiB | 3200 MiB | accurate |
-| medium-q5_0 / medium.en-q5_0 | 514 MiB | 1200 MiB | accurate |
-| medium-q8_0 / medium.en-q8_0 | 785 MiB | 1600 MiB | accurate |
-| large-v1 / large-v2 / large-v3 | 2.9 GiB | 3200 MiB | slow |
-| large-v2-q5_0 / large-v3-q5_0 | 1.1 GiB | 2100 MiB | slow |
-| large-v2-q8_0 | 1.5 GiB | 3200 MiB | slow |
-| large-v3-turbo | 1.5 GiB | 3200 MiB | accurate |
-| large-v3-turbo-q5_0 | 547 MiB | 1200 MiB | accurate |
-| large-v3-turbo-q8_0 | 834 MiB | 1600 MiB | accurate |
+| model family | download size | approximate RAM | profile |
+|:--|--:|--:|:--|
+| tiny | 31–75 MiB | 120–200 MiB | fastest |
+| base | 57–142 MiB | 200–500 MiB | fast |
+| small | 181–466 MiB | 500–1,200 MiB | balanced |
+| medium | 514 MiB–1.5 GiB | 1,200–3,200 MiB | higher accuracy |
+| large | 1.1–2.9 GiB | 2,100–3,200 MiB | slower |
+| large-v3-turbo | 547 MiB–1.5 GiB | 1,200–3,200 MiB | quality / speed balance |
 
-sizes are from the upstream table. a quantized model is smaller and usually
-quicker on cpu. "usually" is doing real work there; hardware differs, so
-benchmark on your own box before calling anything the fastest. the picker shows
-a ready/get badge and the first 12 characters of each sha.
+**a sensible starting point:** `small-q5_1` is the default. try `tiny` or `base` when speed and memory matter more; try `large-v3-turbo-q5_0` when you want a stronger model and have the memory for it.
 
-custom ggml files work through `--model <path>` but do not show up in the picker.
+these figures are approximate. actual memory use and speed depend on the model variant, audio and hardware. quantization reduces model size and memory requirements, but does not guarantee the same speedup on every CPU.
 
-## export
+model downloads are checked against catalog size and SHA-256 metadata before use. invalid catalog files are rejected. custom model files are checked for plausible size and a recognized GGML/GGUF header, but cannot be checked against a catalog checksum.
 
-`txt`, `srt`, `vtt`, `md`, `json`. files go next to the source, or into `--out`.
-existing files are not overwritten: the write uses exclusive creation, so two
-processes racing on the same name cannot clobber one another, and a failed write
-removes its own partial output.
+models ending in `.en` are English-only. other catalog models are multilingual. use `--lang auto` for language detection or pass a language code when you know the spoken language.
 
-word timings come from whisper's token data. in `srt` and `vtt`, segments with
-word timings produce one cue per word (no overlapping segment cue); segments
-without word timings produce a single segment cue. cues are sorted, clamped so
-they never overlap, and sanitized to one line. `json` gets a `words` array per
-segment, and markdown turns each word into a clickable timestamp link when the
-source is a youtube url.
+## exports
 
-## performance notes
+| format | best for |
+|:--|:--|
+| `txt` | plain transcript text |
+| `srt` | video editors and media players |
+| `vtt` | web video captions |
+| `md` | notes and readable documentation |
+| `json` | scripts and structured processing |
 
-- cpu only. no cuda, metal, vulkan, hipblas, coreml or sycl code is compiled in.
-- threads default to `min(logical cores, 8)`. `--threads` or the settings panel
-  can override that.
-- ffmpeg decodes incrementally and whisper runs 30-second windows with overlap
-  handling, so words land while the tape is still rolling. stderr is drained on
-  its own thread with a bounded tail, so a noisy decoder cannot deadlock the
-  reader or flood the screen. the decoder's exit status is checked: partial pcm
-  from a failed decode is never reported as a successful transcript.
-- each job has a unique id carried on every worker event. events from a stopped
-  job are dropped, so old segments or a stale "done" cannot land in a new
-  transcript. workers are joined on shutdown.
-- wrapped transcript lines are cached until segments or terminal width change,
-  and search tests only new segments while the query is unchanged. static
-  overlays no longer force redraws every frame.
-- completion, scroll and status transitions are eased over a few frames; the ui
-  goes quiet when nothing moves.
-- if the text comes out nonsense, it is probably the model, not the pipeline.
-  try turbo before filing an accuracy bug.
+exports are written beside the source by default, or to the directory passed with `--out`. existing files are not overwritten. output creation is exclusive, and a failed write removes its own partial file.
 
-## the screen
+SRT and VTT use one cue per word when word timing is available. otherwise, they use one cue per segment. cues are sorted, clamped to avoid overlap and normalized to one line. JSON includes a `words` array per segment. Markdown can include clickable timestamp links for YouTube sources.
 
-wide terminals get the transcript plus a side panel for session info, progress
-and a level meter. medium ones stack a compact status row under the transcript.
-narrow ones drop the side panel entirely. the layout does not try to squeeze a
-30-column pane into a 24-column terminal and call that responsive. below 20
-columns you get a short message asking for more room, which is the honest
-outcome.
+## themes
 
-the ui reads its colors from the selected palette, keeps the canvas transparent
-so terminal blur shows through, and respects `NO_COLOR`, 16-colour ansi and
-truecolor detection. pasting via bracketed paste never fires stray shortcuts.
-toasts sit in the bottom-right corner and fade on their own; they carry
-download and pause news without interrupting the transcript.
+22 palettes are available at runtime through `t`:
 
-## versions
+catppuccin mocha · catppuccin macchiato · catppuccin frappe · catppuccin latte · tokyo night · tokyo night storm · nord · dracula · gruvbox dark · one dark · solarized dark · solarized light · github dark · github light · everforest · kanagawa · rose pine · rose pine dawn · material dark · palenight · cyberpunk · high contrast
 
-checked against crates.io and docs.rs, pinned in `Cargo.toml`.
+set the startup palette with `--theme <name>`. common aliases are accepted. unknown names fall back to catppuccin mocha.
 
-| crate | version | note |
-| --- | --- | --- |
-| rust | stable, edition 2024 | msrv 1.90 |
-| ratatui | 0.30.2 | crossterm 0.29 re-export |
-| crossterm | 0.29.0 | same major, no version skew |
-| whisper-rs | 0.16.0 | cpu-only, all gpu features off |
-| yt-dlp | 2.10.0 | cache-json + rustls features |
-| tokio | 1.54.1 | current-thread runtime for url fetch only |
-| ureq | 3.5.2 | model downloads |
-| sha2 | 0.11.1 | model checksum verification |
-| unicode-width | 0.2.3 | wrapping that does not cut wide glyphs |
-| which | 8 | find system ffprobe |
+the interface adapts to terminal width, supports 16-colour ANSI and truecolor, respects `NO_COLOR`, and keeps the terminal background transparent. bracketed paste is supported. narrow terminals use a simpler layout instead of squeezing the side panel into unusable space.
 
-two quirks worth knowing: yt-dlp 2.10.0 needs a cache feature just to compile,
-and whisper-rs 0.16's abort callback is unreliable mid-encode. both are worked
-around in code. if you touch those lines, leave the comments alone.
+## privacy
 
-## limits, honestly
+**audio transcription and inference happen locally.** scribe does not send your audio or transcript to a hosted transcription service.
 
-- some sites want cookies or a specific player client. yt-dlp covers 1800+, but
-  authentication stays a site-by-site problem.
-- word timings follow whisper token boundaries, not forced alignment. a token
-  can cover several words in some languages.
-- custom ggml models work through `--model` but are not in the picker.
-- pausing a transcription parks inference between decode windows, not in the
-  middle of one. a fetch or decode step that is already running finishes, and
-  the ui says so. the ui ignores late events and resumes at the last committed
-  position.
-- stdin piping and batch transcription are deliberately not implemented in
-  0.3.0. neither fits the current single-job lifecycle well enough to ship
-  reliably.
-- model downloads need network access once. url transcription needs network
-  access every time. audio decoding and inference are local and offline.
-- release artifacts are built by ci on linux x86_64, macos aarch64 and windows
-  x86_64. other targets are not tested.
+- audio is decoded on your machine.
+- whisper.cpp runs locally on your CPU.
+- transcripts and settings are stored locally.
+- no account is required.
+- no telemetry is included.
 
-## building from source
+network access is still used for:
 
-whisper-rs compiles whisper.cpp through bindings, so a c/c++ toolchain and
-cmake are needed. on debian/ubuntu:
+- downloading a model the first time you use it.
+- retrieving media from the source platform when you provide a URL.
+- downloading managed yt-dlp and FFmpeg binaries for URL workflows when they are missing.
+
+after a model is cached, transcribing a local file does not require an internet connection.
+
+## storage and diagnostics
+
+models are stored in the platform cache:
+
+| platform | model cache |
+|:--|:--|
+| linux | `~/.cache/scribe/models` |
+| macOS | `~/Library/Caches/scribe/models` |
+| windows | `%LOCALAPPDATA%\\scribe\\models` |
+
+`$XDG_CACHE_HOME` is respected where applicable. settings are stored in the platform config directory, typically `~/.config/scribe/config` on linux or under `$XDG_CONFIG_HOME`.
+
+run the diagnostic command for a read-only report:
 
 ```sh
-sudo apt-get install clang libclang-dev cmake pkg-config
+scribe --doctor
 ```
 
-macos needs xcode command line tools and cmake; windows needs the msvc build
-tools and cmake. the cpu-only build has no cuda/metal/vulkan backend to link.
-at runtime, local files need ffmpeg, and url input additionally uses yt-dlp,
-which scribe fetches on first use if no managed copy exists.
+it checks dependencies, model integrity, paths and permissions. it does not install packages or modify files.
 
-## build, test, run
+## performance and implementation
+
+- CPU-only build. CUDA, Metal, Vulkan, HIPBLAS, Core ML and SYCL backends are not compiled in.
+- the default thread count is `min(logical cores, 8)`. override it with `--threads` or the settings panel.
+- FFmpeg decodes incrementally. whisper processes 30-second windows with overlap handling.
+- decoder stderr is drained separately with a bounded tail. decoder exit status is checked before partial audio is treated as a successful transcript.
+- worker events carry a job ID. events from stopped jobs are discarded, and workers are joined during shutdown.
+- transcript wrapping is cached until segments or terminal width change. search checks new segments while the query stays unchanged.
+- interface transitions are eased over a few frames. the UI becomes idle when nothing is changing.
+
+## troubleshooting
+
+**the first transcription takes a while**
+
+the model must be downloaded before its first use. larger models take longer to download and need more memory.
+
+**local audio cannot be opened**
+
+install FFmpeg and confirm it is available on your `PATH`. then run `scribe --doctor`.
+
+**a URL cannot be fetched**
+
+URL support depends on yt-dlp and the source site's access rules. some sites require cookies or a specific player client.
+
+**transcription is too slow**
+
+try a smaller model such as `base-q5_1` or `small-q5_1`, and check the thread setting. CPU performance varies by processor and model.
+
+**a model fails its integrity check**
+
+remove the cached model from the model picker and download it again. scribe verifies catalog downloads against their expected SHA-256 digest.
+
+## known limits
+
+- URL support depends on yt-dlp and the source site's access rules.
+- word timestamps follow Whisper token timing, not forced alignment. one token can represent multiple words in some languages.
+- custom GGML models can be loaded by path but do not appear in the model picker.
+- pausing takes effect between decode windows. an in-progress fetch or decode step is allowed to finish.
+- stdin piping and batch transcription are not implemented in 0.3.0.
+- model downloads require network access once. URL transcription requires network access each time.
+- release artifacts currently target Linux x86_64, macOS arm64 and Windows x86_64. other targets are not tested.
+
+## build from source
 
 ```sh
+git clone https://github.com/programmersd21/scribe.git
+cd scribe
 cargo build --release
-cargo test
-cargo clippy --all-targets -- -D warnings
-cargo fmt --all -- --check
-cargo publish --dry-run --allow-dirty   # packaging check, nothing is uploaded
+```
+
+run the binary:
+
+```sh
 ./target/release/scribe
 ```
 
+run the project checks:
+
+```sh
+cargo fmt --all -- --check
+cargo clippy --locked --all-targets --all-features -- -D warnings
+cargo test --locked --all-targets --all-features
+cargo check --locked --all-targets
+```
+
+CI checks formatting, Clippy, tests, CLI smoke behaviour and the Rust 1.90 minimum supported version. release builds target the three platforms listed above.
+
+## dependencies
+
+| project | role |
+|:--|:--|
+| [whisper.cpp](https://github.com/ggml-org/whisper.cpp) | local speech recognition engine |
+| [whisper-rs](https://github.com/tazz4843/whisper-rs) | Rust bindings for whisper.cpp |
+| [Ratatui](https://github.com/ratatui/ratatui) | terminal interface |
+| [Crossterm](https://github.com/crossterm-rs/crossterm) | terminal input and rendering |
+| [FFmpeg](https://ffmpeg.org/) | audio decoding |
+| [yt-dlp](https://github.com/yt-dlp/yt-dlp) | URL media extraction |
+
+## contributing
+
+issues and pull requests are welcome.
+
+when reporting a bug, include:
+
+- operating system and architecture
+- terminal emulator
+- input format and source type
+- command used
+- model and language
+- relevant output from `scribe --doctor`
+
+run formatting, tests and Clippy before opening a pull request.
+
 ## license
 
-mit
+[MIT](LICENSE)
+
+---
+
+<p align="center">
+  built for people who want their words, their machine and their privacy.
+  <br>
+  <a href="https://github.com/programmersd21/scribe">source code</a> ·
+  <a href="https://github.com/programmersd21/scribe/issues">report an issue</a> ·
+  <a href="https://github.com/programmersd21/scribe/releases/latest">latest release</a>
+</p>
